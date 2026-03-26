@@ -1,3 +1,4 @@
+FROM quay.io/openshift/ci:ocp_4.20_cli
 RUN <<run-EOF
 set -exo pipefail; shopt -s inherit_errexit
 typeset binDir=/usr/local/bin
@@ -28,8 +29,8 @@ rm -rf /var/cache/dnf/*
         jq -r \
             --arg os "$(uname -s | tr '[:upper:]' '[:lower:]')" \
             --arg cpu "$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" \
-            '.tag_name as $tag | .assets[] | select(.name=="virtctl-\($tag)-\($os)-\(cpu).zip").browser_download_url'
+            '.tag_name as $tag | .assets[] | select(.name=="virtctl-\($tag)-\($os)-\($cpu)").browser_download_url'
     )"
-    chmod a+x "${binDir}/yq"
+    chmod a+x "${binDir}/virtctl"
 }
 run-EOF
