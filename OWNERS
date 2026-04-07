@@ -1,0 +1,6 @@
+# See the OWNERS docs: https://git.k8s.io/community/contributors/guide/owners.md
+approvers:  &owners
+  - ieng-chaos
+  - paigerube14
+  - chaitanyaenr
+reviewers: *owners
