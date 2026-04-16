@@ -1,6 +1,6 @@
 # Contributing
 ## Common
-Read [`README.md`](README.md) to understand the repository structure and conventions before contributing.
+Read [`README.md`](README.md), if not yet been read, to understand the repository structure and conventions before contributing.
 
 For all coding standards (regardless of language), follow the
 [Best Practices](https://edttjredhat.github.io/RHP-Wiki/Confluence/MPEXIENG/Test+Infrastructure/Best+Practises/Section0--Best_Practices.html).
@@ -19,4 +19,4 @@ Follow the rebasing and squashing workflow described in the
 
 
 ## AI Agents
-Read [`AGENTS.md`](AGENTS.md) for agent-specific contribution instructions.
+Read [`AGENTS.md`](AGENTS.md), if not yet been read, for agent-specific contribution instructions.
