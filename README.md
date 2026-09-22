@@ -24,3 +24,9 @@ It may contain Group Aliases from https://github.com/openshift/release/blob/main
     exec 3<&-
 )
 ```
+
+## Coverage catalog
+`test/metadata/coverage-catalog/catalog.py` maps
+ci-operator `as:` names to topic and scenario for
+the Virt Chaos dashboard. Topic is Migration,
+Snapshot, Standard, or Upgrade.
