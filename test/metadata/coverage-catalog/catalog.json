@@ -1,0 +1,84 @@
+{
+  "topics": [
+    "Migration",
+    "Snapshot",
+    "Standard",
+    "Upgrade"
+  ],
+  "scenarios": [
+    {
+      "scenarioId": "cnv-outage-kubevirt",
+      "scenarioName": "KubeVirt outage",
+      "topic": "Standard",
+      "testAs": [
+        "cr--cnv--outage-kubevirt--aws",
+        "kubevirt-outage"
+      ]
+    },
+    {
+      "scenarioId": "cnv-outage-node",
+      "scenarioName": "Node outage",
+      "topic": "Standard",
+      "testAs": [
+        "cr--cnv--outage-node--aws",
+        "lp-chaos--cnv--node-outage"
+      ]
+    },
+    {
+      "scenarioId": "cnv-outage-pod",
+      "scenarioName": "Pod outage",
+      "topic": "Standard",
+      "testAs": [
+        "cr--cnv--outage-pod--aws"
+      ]
+    },
+    {
+      "scenarioId": "cnv-snapshot-kill-apiserver",
+      "scenarioName": "Snapshot kill API server",
+      "topic": "Snapshot",
+      "testAs": [
+        "cr--cnv--snapshot--kill--apiserver--aws"
+      ]
+    },
+    {
+      "scenarioId": "cnv-snapshot-kill-controller",
+      "scenarioName": "Snapshot kill controller",
+      "topic": "Snapshot",
+      "testAs": [
+        "cr--cnv--snapshot--kill--controller--aws"
+      ]
+    },
+    {
+      "scenarioId": "cnv-snapshot-kill-csi-driver",
+      "scenarioName": "Snapshot kill CSI driver",
+      "topic": "Snapshot",
+      "testAs": [
+        "cr--cnv--snapshot--kill--csi-driver--aws"
+      ]
+    },
+    {
+      "scenarioId": "cnv-snapshot-kill-virt-api",
+      "scenarioName": "Snapshot kill virt-api",
+      "topic": "Snapshot",
+      "testAs": [
+        "cr--cnv--snapshot--kill--virt-api--aws"
+      ]
+    },
+    {
+      "scenarioId": "cnv-krkn-hub",
+      "scenarioName": "Krkn hub tests",
+      "topic": "Standard",
+      "testAs": [
+        "krkn-hub-tests"
+      ]
+    },
+    {
+      "scenarioId": "cnv-krkn-hub-node",
+      "scenarioName": "Krkn hub node tests",
+      "topic": "Standard",
+      "testAs": [
+        "krkn-hub-node-tests"
+      ]
+    }
+  ]
+}
