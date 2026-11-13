@@ -1,0 +1,76 @@
+'''
+YAML configuration utilities: Jinja2 template rendering and format conversion.
+'''
+import json
+from pathlib import Path
+from typing import Any, Dict
+
+from jinja2 import Environment, FileSystemLoader
+import yaml
+
+
+class YAMLcfg:
+    '''
+    YAML configuration helper for Jinja2 template rendering and format
+    conversions (YAML, JSON, and Python dict).
+    '''
+
+    @staticmethod
+    def Render(tmplPath: Path, ctxData: Dict[str, Any]) -> str:
+        '''
+        Render a Jinja2 template file to a YAML string.
+
+        :param tmplPath:            The `Path` to the Jinja2 template file.
+        :param ctxData:             Context data `dict` for template rendering.
+
+        :return:                    Rendered YAML as a `str`.
+
+        :raises FileNotFoundError:  If the template file does not exist.
+        '''
+        if not tmplPath.exists():
+            raise FileNotFoundError(
+                f'Template file not found at: {tmplPath}'
+            )
+        return Environment(
+            loader=FileSystemLoader(str(tmplPath.parent)),
+            keep_trailing_newline=True,
+        ).get_template(tmplPath.name).render(ctxData)
+
+    @staticmethod
+    def ToDict(data: 'str | Dict[str, Any]') -> Dict[str, Any]:
+        '''
+        Parse YAML/JSON mapping input or return a supplied `dict`.
+
+        :param data:    YAML/JSON `str` or `dict` (returned as-is).
+
+        :return:
+            The supplied `dict` or parsed value. Truthy non-mapping values
+            are returned unchanged. Blank or other falsy results become `{}`.
+        '''
+        if isinstance(data, dict): return data
+        return (yaml.safe_load(data) or {})
+
+    @staticmethod
+    def ToJSON(data: 'str | Dict[str, Any]', indent: int = 2) -> str:
+        '''
+        Serialize as JSON.
+
+        :param data:    YAML/JSON `str` or `dict`.
+        :param indent:  JSON indentation level (default: `2`).
+
+        :return:        JSON `str`.
+        '''
+        if isinstance(data, str): data = yaml.safe_load(data) or {}
+        return json.dumps(data, indent=indent)
+
+    @staticmethod
+    def ToYAML(data: 'str | Dict[str, Any]') -> str:
+        '''
+        Serialize as YAML.
+
+        :param data:    JSON `str` or `dict`.
+
+        :return:        YAML `str`.
+        '''
+        if isinstance(data, str): data = json.loads(data)
+        return yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
