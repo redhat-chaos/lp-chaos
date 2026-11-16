@@ -65,7 +65,9 @@ class VM:
         except Exception as error: clnFail.append(str(error))
         if clnFail:
             clnErr = 'VM cleanup failed: ' + '; '.join(clnFail)
-            if (primExc is None): raise RuntimeError(clnErr)
+            if (
+                (primExc is None) or isinstance(primExc, GeneratorExit)
+            ): raise RuntimeError(clnErr)
             logs.error('%s; preserving primary exception: %s', clnErr, primExc)
 
     def __init__(
@@ -108,24 +110,28 @@ class VM:
     def _Status(self) -> str:
         '''Query the VM's current `printableStatus` via `oc get`.'''
         result = self.cli.oc.Run(
-            'get', f'VirtualMachine/{self.name}',
-            o="jsonpath='{.status.printableStatus}'",
+            'get',
+            f'VirtualMachine/{self.name}',
+            o='jsonpath={.status.printableStatus}',
         )
-        return result.stdout.strip("'") if result.success else ''
+        return result.stdout if result.success else ''
 
-    def Start(
-        self,
-        timeout: str = '5m',
-        provTO: float = 1800.0,
-    ) -> bool:
+    def Start(self, timeout: str = '5m', provTO: int = 1800) -> bool:
         '''
         Wait for provisioning to finish, then start the VM.
 
         :param timeout: Maximum time to wait for VM readiness (default: `5m`).
-        :param provTO:  Provisioning wait budget in sec. (default: `1800.0`).
+        :param provTO:  Provisioning wait budget in sec. (default: `1800`).
 
-        :return:        `True` if the VM reaches ready state.
+        :return:        Return `True` if the VM reaches ready state.
+
+        :raises ValueError: The `provTO` is invalid.
         '''
+        if (
+            not isinstance(provTO, int) or
+            isinstance(provTO, bool) or
+            (provTO <= 0)
+        ): raise ValueError('The `provTO` must be a positive integer.')
         provDeadline = time.monotonic() + provTO
         while True:
             status = self._Status()
@@ -168,15 +174,18 @@ class VM:
         '''
         Create a new `RHOVsshCon` instance for this VM.
 
-        Probes SSH readiness before returning, with a retry timeout and waits
-        capped to its remaining duration.
+        Probes SSH readiness within the given budget.
 
         :param probeTO:
-            Positive numeric SSH retry timeout in seconds (default: `300`).
+            Total budget (in sec.) for probing SSH readiness (default: `300`),
+            passed through to `RHOVsshCon.Probe()`.
         :param kwArgs:
             Forwarded to `RHOVsshCon.__init__` (override `user`, `idFile`,
-            `virtCtl`, etc.). Defaults to this VM's `virtCtl` client; pass
-            `virtCtl=None` to create a client using `ns` and `kubeconfig`.
+            `virtCtl`, `oc`, etc.). Defaults to this VM's client pair. Either
+            client can be overridden independently. Pass `virtCtl=None` or
+            `oc=None` to create the corresponding client using `ns` and
+            `kubeconfig`. The caller must ensure both clients address the same
+            cluster.
 
         :return:
             A new `RHOVsshCon` instance, probed for readiness.
@@ -187,9 +196,10 @@ class VM:
             'user': self.sshUsr,
             'idFile': (self.sshKey or '~/.ssh/id_ed25519'),
             'virtCtl': self.cli.virtCtl,
+            'oc': self.cli.oc,
         }
         conn = RHOVsshCon(**{**defArgs, **kwArgs})
-        if not conn.Probe(timeout=probeTO):
+        if not conn.Probe(probeTO):
             raise TimeoutError(
                 f'SSH readiness probe timed out for VM `{self.name}` '
                 f'after {probeTO} seconds.'

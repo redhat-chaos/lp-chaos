@@ -1,4 +1,5 @@
 '''Thin shim around the `oc` CLI.'''
+from copy import copy
 from enum import auto, IntEnum
 import json
 import logging
@@ -47,6 +48,26 @@ class OCcli(GoCobraCLI):
         '''
         super().__init__(binExec, cmdExec=cmdExec, **defOpts)
 
+    def _InNS(self, ns: Optional[str]) -> 'OCcli':
+        '''
+        Return a Namespace-bound client view without changing this client.
+
+        :param ns:
+            Resource Namespace. An absent or empty string value keeps this
+            client.
+
+        :return:
+            This client, or a shallow copy with independent Namespace
+            defaults and the same executor and discovered options.
+        '''
+        if not ns: return self
+        (scoped := copy(self)).defOpts = {
+            key: value
+            for (key, value) in self.defOpts.items()
+            if (key not in {'n', 'namespace'})
+        } | {'n': ns}
+        return scoped
+
     def EnsureRes(
         self,
         resYAMLorSubCmd: Union[str, dict[str, Any]],
@@ -63,8 +84,10 @@ class OCcli(GoCobraCLI):
             Resource YAML Manifest or create sub-command specification, as in
             `self.NewRes`.
         :param owned:
-            Ownership records (oc, resRef, resUID). Only successfully created
-            resources are appended; existing resources stay unowned.
+            Ownership records (oc, resRef, resUID). The recorded client is
+            bound to the live object's Namespace without changing this client's
+            defaults. Only successfully created resources are appended.
+            Existing resources stay unowned.
         :param isSecret:
             Protect command input and output containing credential data.
         :param existResDelTO:
@@ -82,8 +105,6 @@ class OCcli(GoCobraCLI):
             deletion wait failed, the re-ensure still finds a deleting object,
             or a new resource lacks kind, name or UID. The message identifies
             the operation/phase without including command output.
-        :raises ValueError:
-            The `self.NewRes()` received invalid resource Live Object State.
         '''
         optsNewRes = dict(optsNewRes or {}) | {'isSecret': isSecret}
         optsNewRes.pop('resYAMLorSubCmd', None)
@@ -129,6 +150,7 @@ class OCcli(GoCobraCLI):
                     f'`EnsureRes()`: Invalid identity at `{phase.name}`.'
                 ) from None
             resRef = f'{kind}/{name}'
+            resOC = self._InNS(resource['metadata'].get('namespace'))
             if deleting:
                 message = (
                     f'`EnsureRes()`: Waiting for deletion of `{resRef}` '
@@ -141,7 +163,7 @@ class OCcli(GoCobraCLI):
                         f'after wating for `{existResDelTO}`.'
                     )
                 try:
-                    waited = self.Run(
+                    waited = resOC.Run(
                         'wait',
                         resRef,
                         isSecret=isSecret,
@@ -151,7 +173,7 @@ class OCcli(GoCobraCLI):
                 if not waited.success: raise RuntimeError(message)
                 reCreate = True
                 continue
-            owned.append((self, resRef, uid))
+            owned.append((resOC, resRef, uid))
             return resource
 
     def NewRes(
@@ -216,8 +238,6 @@ class OCcli(GoCobraCLI):
             A successful lookup or apply returned invalid resource JSON, or
             the apply response lacks the identity needed for the wait.
             The error identifies the phase without including response data.
-        :raises Exception:
-            Propagates exceptions from the CLI command runner.
         '''
         if isinstance(resYAMLorSubCmd, str):
             # YAML path: oc create -f - --dry-run=client -o yaml --save-config
@@ -231,9 +251,9 @@ class OCcli(GoCobraCLI):
         else:
             # Sub-command path: oc create <subCmd> *args **opts --dry-run ...
             createOpts = {
-                'isSecret': isSecret,
                 **resYAMLorSubCmd.get('opts', {}),
                 'dry_run': 'client', 'o': 'yaml', 'save_config': True,
+                'isSecret': isSecret,
             }
             dryRun = self.Run(
                 f"create {resYAMLorSubCmd['subCmd']}",
@@ -264,6 +284,7 @@ class OCcli(GoCobraCLI):
                 return (self.ResPhase.EXISTED, found, resObj)
 
         completed = False
+        cleanupUID = None
         try:
             applied = self.Run(
                 'apply',
@@ -293,7 +314,13 @@ class OCcli(GoCobraCLI):
                 raise ValueError(
                     '`NewRes()`: Apply response has no wait resource identity.'
                 ) from None
-            waited = self.Run(
+            uid = resObj['metadata'].get('uid')
+            if (checkExist and all(
+                (isinstance(value, str) and value)
+                for value in (resObj['kind'], resObj['metadata']['name'], uid)
+            )): cleanupUID = uid
+            resOC = self._InNS(resObj['metadata'].get('namespace'))
+            waited = resOC.Run(
                 'wait',
                 resRef,
                 isSecret=isSecret,
@@ -302,17 +329,27 @@ class OCcli(GoCobraCLI):
             completed = waited.success
             return (self.ResPhase.WAITED, waited, resObj)
         finally:
-            if not completed:
+            if (not completed and (cleanupUID is not None)):
                 try:
-                    self.Run(
-                        'delete',
-                        '-f', '-',
-                        input=dryRun.stdout,
+                    current = resOC.Run(
+                        'get',
+                        resRef,
                         isSecret=isSecret,
                         spPars={'timeout': 30},
-                        force=True, grace_period=0, ignore_not_found=True,
-                        wait=False,
+                        o='jsonpath={.metadata.uid}', ignore_not_found=True,
                     )
+                    if (
+                        current.success and
+                        ((current.stdout or '').strip() == cleanupUID)
+                    ):
+                        resOC.Run(
+                            'delete',
+                            resRef,
+                            isSecret=isSecret,
+                            spPars={'timeout': 30},
+                            force=True, grace_period=0, ignore_not_found=True,
+                            wait=False,
+                        )
                 except Exception:
                     logs.warning('Best-effort failed creation cleanup failed.')
 
@@ -329,9 +366,6 @@ class OCcli(GoCobraCLI):
               - resUID:     Stripped Resource UID output, empty if the resource
                             is absent.
               - lookupErr:  Stripped standard error output, which may be empty.
-
-        :raises Exception:
-            Propagates exceptions from the CLI command runner.
         '''
         result = self.Run(
             'get',
@@ -354,7 +388,8 @@ class OCcli(GoCobraCLI):
 
         :param ownRes:
             Ownership records containing:
-              - oc:     CLI client from the resource creation context.
+              - oc:     CLI client from the resource creation context, bound to
+                        its namespace when one was returned.
               - resRef: Resource Reference (`<kind>/<name>`).
               - ownUID: Resource UID recorded after resource creation.
         :param optsDelRes:
@@ -409,7 +444,9 @@ class OCcli(GoCobraCLI):
                 logs.exception('Could not clean up resource `%s`.', resRef)
         if clnFail:
             clnErr = 'Resource cleanup failed: ' + '; '.join(clnFail)
-            if (primExc is None): raise RuntimeError(clnErr)
+            if (
+                (primExc is None) or isinstance(primExc, GeneratorExit)
+            ): raise RuntimeError(clnErr)
             logs.error('%s; preserving primary exception.', clnErr)
 
     def DelRes(

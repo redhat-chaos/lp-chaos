@@ -1,6 +1,26 @@
 '''
-Call an importable Module Function using the same Major/Minor Version CPython
+Call an importable Module Function using the same exact Version CPython
 VirtualEnv.
+
+This approach is meant to solve conflict of Python external packages (installed
+via `pip`) between different external (vendor) library. It's NOT meant to allow
+using different version of Python Interpreter.
+
+This module relies on `multiprocessing.spawn.spawn_main()` behavior, as
+essentially the child is invoked as below:
+```python
+python -c '
+    from multiprocessing.spawn import spawn_main; spawn_main(...)
+' --multiprocessing-fork
+```
+
+Use `python -m pytest ...`, not `pytest ...`, to avoid replaying the console
+script before the worker resets its env. Exact interpreter versions are checked
+via sister module `./LibInVenv_Worker.py`.
+
+NOTE:
+    The package isolation is NOT guaranteed 100%. Some packages may be imported
+    from parent's env. during bootstrap phase.
 '''
 import multiprocessing as mp
 from multiprocessing import spawn
@@ -8,7 +28,8 @@ from multiprocessing.connection import wait
 import os
 from pathlib import Path
 import sys
-from threading import Lock
+from threading import Event, Lock, Thread
+import time
 from typing import Any, Optional
 
 from libs.CustomTypes import TempEnv
@@ -16,7 +37,7 @@ from libs.Utils.DynLoad import UpdEnv
 from libs.Utils.LibInVenv_Worker import ExitType, _CallInVenv
 
 
-_START_LOCK = Lock()
+_procLock = Lock()
 
 
 class ModInVenv:
@@ -26,13 +47,30 @@ class ModInVenv:
     Arguments, return value and exceptions must be pickleable and their classes
     importable in the receiving process.
     '''
-    def __init__(self, venvRoot: Path, importPaths: tuple = tuple()) -> None:
+    def __init__(
+        self,
+        venvRoot: Path,
+        importPaths: tuple = tuple(),
+        execTO: Optional[int] = None,
+    ) -> None:
         '''
         Resolve the vEnv CPython interpreter.
 
         :param venvRoot:    Root of the target Python virtual environment.
         :param importPaths: Extra module lookup paths.
+        :param execTO:
+            Module execution budget in sec. (default: `None`, no limit).
+
+        :raises ValueError: If execTO is invalid.
         '''
+        if (
+            (execTO is not None) and (
+                not isinstance(execTO, int) or
+                isinstance(execTO, bool) or
+                (execTO <= 0)
+            )
+        ): raise ValueError('The `execTO` must be a positive integer.')
+        self.execTO = execTO
         self.venvRoot = Path(venvRoot).expanduser().resolve()
         self.pyPath = self.venvRoot / (
             'Scripts/python.exe' if (os.name == 'nt') else 'bin/python'
@@ -60,7 +98,7 @@ class ModInVenv:
         :param funcName:
             Callable attribute to invoke in the requested Module.
         :param envUpd:
-            A `dict` containing Env. Variables to bet set or removed (set the
+            A `dict` containing Env. Variables to be set or removed (set the
             value to `None`) in the child process.
         :param args:        Positional arguments for the target Callable.
         :param kwArgs:      Keyword arguments for the target Callable.
@@ -72,6 +110,7 @@ class ModInVenv:
         :raises RuntimeError:
             Exception transport/reconstruction failure, abnormal exit or
             missing response.
+        :raises TimeoutError:   If the worker execution budget expires.
         '''
         mpCtx = mp.get_context('spawn')
         (rcvPipe, sndPipe) = mpCtx.Pipe(duplex=False)
@@ -82,32 +121,55 @@ class ModInVenv:
                 modName, funcName, args, kwArgs,
                 self.importPaths,
                 str(self.venvRoot),
-                tuple(sys.version_info[:2]),
+                tuple(sys.version_info),
             ),
         )
+        deadline = None
+        toMsg = f'Venv Worker execution timed out after {self.execTO}s.'
         try:
-            with _START_LOCK:
+            with _procLock:
                 origPyBin = spawn.get_executable()
                 try:
                     mp.set_executable(str(self.pyPath))
                     with TempEnv():
                         UpdEnv(envUpd or {})
+                        if (self.execTO is not None):
+                            deadline = (time.monotonic() + self.execTO)
                         proc.start()
                 finally:
                     mp.set_executable(origPyBin)
             sndPipe.close()
-            exitObj = rcvErr = None
-            try: (exitType, exitObj) = rcvPipe.recv()
-            except Exception as ex: rcvErr= ex
-            wait([proc.sentinel])
-            with _START_LOCK:
-                proc.join()
-                exitStat = proc.exitcode
+            exitType = exitObj = rcvErr = None
+            received = Event()
+
+            # The receiver writes first; Event signals completion.
+            def Receive() -> None:
+                nonlocal exitType, exitObj, rcvErr
+                try: (exitType, exitObj) = rcvPipe.recv()
+                except BaseException as error: rcvErr = error
+                finally: received.set()
+
+            if (deadline is None): Receive()
+            else:
+                Thread(target=Receive, daemon=True).start()
+                remTO = (deadline - time.monotonic())
+                if ((remTO <= 0) or not received.wait(remTO)):
+                    raise TimeoutError(toMsg)
             if (rcvErr is not None):
+                if not isinstance(rcvErr, Exception): raise rcvErr
                 raise RuntimeError(
                     'Venv Worker tagged response is missing '
-                    f'(exit status: {exitStat}).'
+                    f'(exit status: {proc.exitcode}).'
                 ) from rcvErr
+            if (deadline is None): wait([proc.sentinel])
+            else:
+                remTO = (deadline - time.monotonic())
+                if ((remTO <= 0) or not wait([proc.sentinel], remTO)):
+                    raise TimeoutError(toMsg)
+            with _procLock:
+                if (deadline is None): proc.join()
+                else: proc.join(0)
+                exitStat = proc.exitcode
             if exitStat:
                 raise RuntimeError(
                     f'Venv Worker exit status: {exitStat}\n'
@@ -128,7 +190,7 @@ class ModInVenv:
             return exitObj
         finally:
             sndPipe.close()
-            with _START_LOCK:
+            with _procLock:
                 if proc.is_alive():
                     proc.terminate()
                     proc.join(1)

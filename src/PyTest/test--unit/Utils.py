@@ -13,6 +13,7 @@ from libs.Utils.CmdExec import CmdExec, CmdRes
 class RHOVconnectionContext(NamedTuple):
     connection: RHOVsshCon
     virtCtl: mock.MagicMock
+    oc: mock.MagicMock
     cmdExec: mock.MagicMock
 
 class VMcontext(NamedTuple):
@@ -32,15 +33,13 @@ class FakeClock:
         self.now += duration
 
 
-def AutoPatch(
-    monkeypatch: pytest.MonkeyPatch,
-    target: Any,
-    name: str,
-) -> None:
-    '''Replace `target.name` with an autospecced mock of that attribute.
+def AutoPatch(monkeypatch: pytest.MonkeyPatch, target: Any, name: str) -> None:
+    '''
+    Replace `target.name` with an autospecced mock of that attribute.
 
-    `target` is intentionally dynamic because patch namespaces may be modules,
-    classes, or instances.
+    :param monkeypatch: PyTest patch manager.
+    :param target:      Module, class, or instance containing the attribute.
+    :param name:        Attribute name to patch.
     '''
     spec = mock.create_autospec(getattr(target, name))
     monkeypatch.setattr(target, name, spec)

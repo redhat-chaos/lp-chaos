@@ -30,6 +30,7 @@ _DEF__FXT_CFG = NamedDict(
         os.environ.get('KUBECONFIG') or
         os.path.expanduser('~/.kube/config')
     ),
+    # The `--kubeconfig` option will be overridden by the above `.kCfg`.
     cliCfg=NamedDict(
         ocCfg={},
         vcCfg={},
@@ -54,7 +55,16 @@ _DEF__FXT_CFG = NamedDict(
             wlName='windows',
             wlKind='vm',
             brEnv={},
-            timeout=NamedDict(vmStart='15m', vmRemove='5m'),
+            timeout=NamedDict(
+                # One-time overhead (min.), mainly for external VM Image
+                #   Template import into an internal PVC.
+                brExecOH=30,
+                # Per-VM allowance (min.) for internal import from the above
+                #   PVC.
+                brExecVM=5,
+                vmStart='15m',
+                vmRemove='5m',
+            ),
         ),
         gstCfg=NamedDict(
             usrCrd=NamedDict(
@@ -134,6 +144,16 @@ def VMcreateByBR(
     if (vmCount < 0): raise ValueError('VM count must not be negative.')
     if not vmCount: return []
 
+    brTO = fxtCfg.fxtInf.brCfg.timeout
+    for key in ('brExecOH', 'brExecVM'):
+        value = brTO[key]
+        if (
+            not isinstance(value, int) or
+            isinstance(value, bool) or
+            (value <= 0)
+        ): raise ValueError(f'The `{key}` must be a positive integer.')
+    brExecTO = (60 * (brTO.brExecOH + (vmCount * brTO.brExecVM)))
+
     ns = fxtCfg.ns
     isScale = vmCount > 1
     newVMs = []
@@ -153,11 +173,16 @@ def VMcreateByBR(
         'RUN_ARTIFACTS_PATH': (
             os.environ.get('RUN_ARTIFACTS_PATH') or tempfile.mkdtemp()
         ),
+        'SCALE_NODES': (os.environ.get('SCALE_NODES', '')),
         'UUID': invocationUUID,
     }
     if isScale:
         env['SCALE'] = str(vmCount)
-        env['SCALE_NODES'] = str([os.environ.get('WORKER_NODE')])
+        if (env['SCALE_NODES'] == ''):
+            raise ValueError(
+                'Env. Var. `SCALE_NODES` must set to non-empty string for '
+                'scale.'
+            )
     else:
         env['SCALE'] = ''
         env['SCALE_NODES'] = ''
@@ -167,7 +192,7 @@ def VMcreateByBR(
     for idx in range(vmCount):
         vmName = f'{namePfx}-{truncUUID}'
         if isScale: vmName += f'-{idx}'
-        oc = ocCLI(ns=ns, **fxtCfg.cliCfg.ocCfg)
+        oc = ocCLI(ns=ns, **{**fxtCfg.cliCfg.ocCfg, 'kubeconfig': fxtCfg.kCfg})
         (lookupOK, prevUID, lookupErr) = OCcli.GetResUID(
             oc, f'VirtualMachine/{vmName}'
         )
@@ -184,7 +209,7 @@ def VMcreateByBR(
         brVMs.append((vmName, oc))
 
     try:
-        ModInVenv(fxtCfg.fxtInf.rootPath.br).Call(
+        ModInVenv(fxtCfg.fxtInf.rootPath.br, execTO=brExecTO).Call(
             'benchmark_runner.main.main', 'main', envUpd=env,
         )
     finally:
@@ -246,16 +271,14 @@ def VMcreateByBR(
             ns=ns,
             oc=oc,
             virtCtl=virtCtlCLI(
-                ns=ns, **fxtCfg.cliCfg.vcCfg
+                ns=ns, **{**fxtCfg.cliCfg.vcCfg, 'kubeconfig': fxtCfg.kCfg},
             ),
             sshUsr=fxtCfg.fxtInf.gstCfg.usrCrd.sshUsr,
             sshKey=sshKey,
         ))
         fPars.vmList.append(newVMs[-1])
         if fxtCfg.fxtInf.brCfg.startVM:
-            if not newVMs[-1].Start(
-                timeout=fxtCfg.fxtInf.brCfg.timeout.vmStart,
-            ):
+            if not newVMs[-1].Start(timeout=brTO.vmStart):
                 raise RuntimeError(f'VM `{ns}/{vmName}` failed to start.')
 
     return newVMs
@@ -273,7 +296,7 @@ def FxtVMbyBR(
     VMs live until module teardown. Setup blocks (it is not a non-blocking job
     API) until the separate runner process and default startup/Ready waits end
     not guaranteeing SSH connection to the Guest OS.
-    Prepare the workload/image and Namespace (set WORKER_NODE for scale).
+    Prepare the workload/image and Namespace (set `SCALE_NODES` for scale).
     Existing generated VM names cause failure, not reused.
     A `RUN_ARTIFACTS_PATH` / `ssh` / `vm_key` artifact overrides `sshKey` when
     present. The guest must have been pre-prepared to authorize its matching
@@ -320,6 +343,12 @@ def FxtVMbyBR(
                     Resource kind suffix (default: `'vm'`).
                   - brEnv: Vendor environment overrides (default: {}).
                   - timeout:
+                      - brExecOH:
+                        One-time overhead in min., mainly for external
+                        VM Image Template import (default: `30`).
+                      - brExecVM:
+                        Per-VM internal import allowance in min. (default:
+                        `5`). Runner budget is `brExecOH + count * brExecVM`.
                       - vmStart:
                         The `timeout` par. for `VM.Start()` (default: `'15m'`).
                       - vmRemove:

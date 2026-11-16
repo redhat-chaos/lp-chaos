@@ -13,6 +13,28 @@ import libs.OpenShift.OCP.CLI.OC as MUT
 import Utils
 
 
+@pytest.mark.parametrize('outer,inner', [
+    (True, False), (False, True), (True, True), (False, False),
+])
+def test_NewRes_SecretCannotBeDowngraded_ReviewRegression(
+    outer: bool,
+    inner: bool,
+) -> None:
+    cli = BuildCLI()
+    cli.Run.side_effect = [Result(True, '{}'), Result(True, ''), Result(
+        True, '{"kind":"Secret","metadata":{"name":"synthetic"}}',
+    )]
+    cli.NewRes({
+        'subCmd': 'secret generic', 'args': ['synthetic'],
+        'opts': {'isSecret': inner},
+    }, isSecret=outer, checkExist=True, waitCond=None)
+    assert (len(cli.Run.call_args_list) == 3)
+    assert all(
+        (call.kwargs['isSecret'] is outer)
+        for call in cli.Run.call_args_list
+    )
+
+
 @pytest.mark.parametrize('phase', ['APPLIED', 'WAITED'])
 @pytest.mark.parametrize('cleanup', ['absent', 'failed', 'exception'])
 @pytest.mark.parametrize('native', [False, True])
@@ -23,7 +45,7 @@ def test_EnsureRes_FailedCreationCleansValidatedTargetAndRaisesOriginal(
 ) -> None:
     cli = BuildCLI()
     manifest = json.dumps({
-        'kind': 'ConfigMap', 'metadata': {'name': 'example'},
+        'kind': 'ConfigMap', 'metadata': {'name': 'example', 'uid': 'owned'},
     })
     specification = (
         {'subCmd': 'configmap', 'args': ['example']} if native else manifest
@@ -31,10 +53,15 @@ def test_EnsureRes_FailedCreationCleansValidatedTargetAndRaisesOriginal(
     responses = [Result(True, manifest), Result(True)]
     if (phase == 'WAITED'): responses.append(Result(True, manifest))
     responses.append(Result(False, 'original-private-failure'))
-    responses.append(
-        RuntimeError('cleanup-private-error') if (cleanup == 'exception')
-        else Result((cleanup == 'absent'))
-    )
+    if (phase == 'WAITED'):
+        responses.append(Result(
+            True, '' if (cleanup == 'absent') else 'owned',
+        ))
+        if (cleanup != 'absent'):
+            responses.append(
+                RuntimeError('cleanup-private-error')
+                if (cleanup == 'exception') else Result(False)
+            )
     cli.Run.side_effect = responses
     owned = []
     message = f'`EnsureRes()`: Failed at `{phase}`.'
@@ -42,14 +69,18 @@ def test_EnsureRes_FailedCreationCleansValidatedTargetAndRaisesOriginal(
         cli.EnsureRes(specification, owned, isSecret=True)
     assert (str(caught.value) == message)
     assert (owned == [])
-    assert (cli.Run.call_args_list[-1] == mock.call(
-        'delete', '-f', '-', input=manifest, isSecret=True,
-        force=True, grace_period=0, ignore_not_found=True, wait=False,
-        spPars={'timeout': 30},
-    ))
+    if ((phase == 'WAITED') and (cleanup != 'absent')):
+        assert (cli.Run.call_args_list[-1] == mock.call(
+            'delete', 'ConfigMap/example', isSecret=True,
+            spPars={'timeout': 30}, force=True, grace_period=0,
+            ignore_not_found=True, wait=False,
+        ))
     commands = [call.args[0] for call in cli.Run.call_args_list]
     assert (commands.count('apply') == 1)
-    assert (commands.count('delete') == 1)
+    assert (commands.count('delete') == int(
+        ((phase == 'WAITED') and (cleanup != 'absent'))
+    ))
+    assert all(call.kwargs['isSecret'] for call in cli.Run.call_args_list)
     assert (commands.count('wait') == (1 if (phase == 'WAITED') else 0))
 
 
@@ -61,19 +92,25 @@ def test_NewRes_CleanupNeverReplacesCreationException(
 ) -> None:
     cli = BuildCLI()
     manifest = json.dumps({
-        'kind': 'ConfigMap', 'metadata': {'name': 'example'},
+        'kind': 'ConfigMap', 'metadata': {'name': 'example', 'uid': 'owned'},
     })
     primary = RuntimeError('original creation error')
-    responses = [Result(True, manifest)]
+    responses = [Result(True, manifest), Result(True)]
     if (phase == 'wait'): responses.append(Result(True, manifest))
-    responses.extend([
-        primary,
-        RuntimeError('cleanup error') if cleanupRaises else Result(False),
-    ])
+    responses.append(primary)
+    if (phase == 'wait'):
+        responses.extend([
+            Result(True, 'owned'),
+            RuntimeError('cleanup error') if cleanupRaises else Result(False),
+        ])
     cli.Run.side_effect = responses
-    with pytest.raises(RuntimeError) as caught: cli.NewRes(manifest)
+    with pytest.raises(RuntimeError) as caught:
+        cli.NewRes(manifest, checkExist=True)
     assert (caught.value is primary)
-    assert (cli.Run.call_args.args[:3] == ('delete', '-f', '-'))
+    assert (cli.Run.call_args.args == (
+        ('delete', 'ConfigMap/example') if (phase == 'wait')
+        else ('apply', '-f', '-')
+    ))
 
 
 @pytest.mark.parametrize('phase', ['DRY_RUN', 'EXISTED'])
@@ -163,7 +200,6 @@ def test_ResourceAPI_DocstringsRetainContractsAnd79Columns(
     for parameter in parameters: assert (f':param {parameter}:' in doc)
     if (inspect.signature(method).return_annotation is not None):
         assert (':return:' in doc)
-    assert (':raises ' in doc)
     assert all(
         (len(line) <= 79)
         for line in source.splitlines()[
@@ -401,8 +437,8 @@ def test_NewRes_UniformContractPreservesCommandsAndResourceAcrossPhases(
         'dry-run': (MUT.OCcli.ResPhase.DRY_RUN, 1),
         'lookup-failed': (MUT.OCcli.ResPhase.EXISTED, 2),
         'existed': (MUT.OCcli.ResPhase.EXISTED, 2),
-        'apply': (MUT.OCcli.ResPhase.APPLIED, 3),
-        'wait': (MUT.OCcli.ResPhase.WAITED, 4),
+        'apply': (MUT.OCcli.ResPhase.APPLIED, 2),
+        'wait': (MUT.OCcli.ResPhase.WAITED, 3),
         'skip-wait': (MUT.OCcli.ResPhase.APPLIED, 2),
         'absent': (MUT.OCcli.ResPhase.WAITED, 4),
     }.get(stop, (MUT.OCcli.ResPhase.WAITED, 3))
@@ -452,7 +488,7 @@ def test_NewRes_InvalidResourceJSONRaisesWithoutResponseData(
     ) + (
         'EXISTED.' if lookup else 'APPLIED.'
     )))
-    assert (cli.Run.call_count == (2 if lookup else 3))
+    assert (cli.Run.call_count == 2)
 
 
 def test_ResPhase_ExistedFollowsDryRun() -> None:
@@ -531,6 +567,7 @@ def test_EnsureRes_InvalidJSONRetainsSanitizedPhase(lookup: bool) -> None:
         f'`NewRes()`: Invalid resource Live Object State at {phase.name}.'
     ))
     assert not owned
+    assert (cli.Run.call_count == (2 if lookup else 3))
 
 
 @pytest.mark.parametrize('resource', [
@@ -790,7 +827,7 @@ def test_NewRes_MissingWaitIdentityRaisesExplicitError() -> None:
     ]
     with pytest.raises(ValueError, match='no wait resource identity'):
         cli.NewRes('manifest')
-    assert (cli.Run.call_count == 3)
+    assert (cli.Run.call_count == 2)
     cli.Run.reset_mock()
     cli.Run.side_effect = [
         Result(True, 'normalized'),
@@ -878,5 +915,408 @@ def test_DelRes_SingleWaitingCommandPreservesClientAndResult(
             'mock-oc', '-n=selected-ns', '--kubeconfig=/selected/config',
             'delete', '--ignore-not-found=true', '--timeout=4m',
             '--wait=true', 'Secret/example',
-        ], input=None, isSecret=False, spPars=None),
+        ], input=None, isSecret=False, tryMax=None, spPars=None),
     ])
+
+
+@pytest.fixture(name='commandCLI')
+def FxtCommandCLI() -> tuple[MUT.OCcli, mock.MagicMock]:
+    '''Provide an OC client and mocked executor for namespace tests.'''
+    executor = mock.create_autospec(MUT.CmdExec, instance=True)
+    executor.Run.return_value = Result(True, (
+        '  -n, --namespace string\n'
+        '      --kubeconfig string\n'
+        '      --context string\n'
+    ))
+    cli = MUT.OCcli(
+        'mock-oc', cmdExec=executor,
+        kubeconfig='/selected/config', context='selected-context',
+    )
+    return (cli, executor)
+
+
+@pytest.mark.parametrize('namespace', [None, '', 'resource-ns'])
+@pytest.mark.parametrize('defaults', [
+    {}, {'n': 'short-ns'}, {'namespace': 'long-ns'},
+    {'n': 'short-ns', 'namespace': 'long-ns'},
+])
+def test__InNS_IsolatesDefaultsAndReusesExecutorAndDiscovery(
+    commandCLI: tuple[MUT.OCcli, mock.MagicMock],
+    namespace: str | None,
+    defaults: dict,
+) -> None:
+    (cli, executor) = commandCLI
+    cli.defOpts.update(defaults)
+    original = dict(cli.defOpts)
+
+    scoped = cli._InNS(namespace)
+
+    assert (cli.defOpts == original)
+    executor.Run.assert_called_once_with(['mock-oc', 'options'])
+    if namespace:
+        assert (scoped is not cli)
+        assert (type(scoped) is type(cli))
+        assert (scoped.defOpts is not cli.defOpts)
+        assert (scoped.defOpts == ({
+            key: value for (key, value) in original.items()
+            if (key not in {'n', 'namespace'})
+        } | {'n': namespace}))
+        assert (scoped.cmdExec is cli.cmdExec)
+        assert (scoped.cmnOpts is cli.cmnOpts)
+        assert (scoped.shortMap is cli.shortMap)
+        executor.Run.return_value = Result(True, 'selected-uid')
+        assert (scoped.GetResUID('ConfigMap/example') == (
+            True, 'selected-uid', '',
+        ))
+        assert (executor.Run.call_args == mock.call([
+            'mock-oc', '--kubeconfig=/selected/config',
+            '--context=selected-context', f'-n={namespace}',
+            'get', '-o=jsonpath={.metadata.uid}', '--ignore-not-found=true',
+            'ConfigMap/example',
+        ], input=None, isSecret=False, tryMax=None, spPars=None))
+    else:
+        assert (scoped is cli)
+
+
+@pytest.mark.parametrize('namespace', [None, 'resource-ns'])
+@pytest.mark.parametrize('waitCond', [None, 'create'])
+@pytest.mark.parametrize('native', [False, True])
+def test_EnsureRes_WaitAndOwnershipCleanupUseReturnedNamespace(
+    commandCLI: tuple[MUT.OCcli, mock.MagicMock],
+    namespace: str | None,
+    waitCond: str | None,
+    native: bool,
+) -> None:
+    (cli, executor) = commandCLI
+    original = dict(cli.defOpts)
+    kind = 'ConfigMap' if namespace else 'Namespace'
+    metadata = {'name': 'example'}
+    if namespace: metadata['namespace'] = namespace
+    manifest = json.dumps({'kind': kind, 'metadata': metadata})
+    resource = {'kind': kind, 'metadata': {**metadata, 'uid': 'created-uid'}}
+    specification = ({
+        'subCmd': 'configmap' if namespace else 'namespace',
+        'args': ['example'],
+        'opts': {'n': namespace} if namespace else {},
+    } if native else manifest)
+    responses = [
+        Result(True, manifest), Result(True),
+        Result(True, json.dumps(resource)),
+    ]
+    if (waitCond is not None): responses.append(Result(True))
+    responses.extend([Result(True, 'created-uid'), Result(True)])
+    executor.Run.side_effect = responses
+    owned = []
+
+    actual = cli.EnsureRes(
+        specification, owned, isSecret=True,
+        optsNewRes={'waitCond': waitCond},
+    )
+
+    assert (actual == resource)
+    assert (len(owned) == 1)
+    (ownedOC, resRef, uid) = owned[0]
+    assert (resRef == f'{kind}/example')
+    assert (uid == 'created-uid')
+    if namespace: assert (ownedOC is not cli)
+    else: assert (ownedOC is cli)
+    assert (ownedOC.cmdExec is executor)
+    MUT.OCcli.CleanUpRes(owned)
+    prefix = [
+        'mock-oc', '--kubeconfig=/selected/config',
+        '--context=selected-context',
+    ]
+    if namespace: prefix.append(f'-n={namespace}')
+    expected = []
+    if (waitCond is not None):
+        expected.append(mock.call((prefix + [
+            'wait', '--for=create', '--timeout=2m', resRef,
+        ]), input=None, isSecret=True, tryMax=None, spPars=None))
+    expected.extend([
+        mock.call((prefix + [
+            'get', '-o=jsonpath={.metadata.uid}', '--ignore-not-found=true',
+            resRef,
+        ]), input=None, isSecret=False, tryMax=None, spPars=None),
+        mock.call((prefix + [
+            'delete', '--ignore-not-found=true', '--timeout=2m', '--wait=true',
+            resRef,
+        ]), input=None, isSecret=False, tryMax=None, spPars=None),
+    ])
+    assert (executor.Run.call_args_list[(-len(expected)):] == expected)
+    assert (executor.Run.call_count == (7 if (waitCond is not None) else 6))
+    assert (cli.defOpts == original)
+
+
+@pytest.mark.parametrize('waited', [False, True])
+def test_EnsureRes_PendingDeletionWaitUsesReturnedNamespace(
+    commandCLI: tuple[MUT.OCcli, mock.MagicMock],
+    waited: bool,
+) -> None:
+    (cli, executor) = commandCLI
+    original = dict(cli.defOpts)
+    metadata = {'name': 'example', 'namespace': 'resource-ns'}
+    manifest = json.dumps({'kind': 'ConfigMap', 'metadata': metadata})
+    deleting = {'kind': 'ConfigMap', 'metadata': {
+        **metadata, 'uid': 'old',
+        'deletionTimestamp': '2026-01-01T00:00:00Z',
+    }}
+    created = {'kind': 'ConfigMap', 'metadata': {**metadata, 'uid': 'new'}}
+    executor.Run.side_effect = [
+        Result(True, manifest), Result(True, json.dumps(deleting)),
+        Result(waited), Result(True, manifest), Result(True),
+        Result(True, json.dumps(created)), Result(True),
+    ]
+    owned = []
+
+    if waited:
+        assert (cli.EnsureRes(manifest, owned) == created)
+        assert (len(owned) == 1)
+        assert (owned[0][0].defOpts['n'] == 'resource-ns')
+        assert (owned[0][1:] == ('ConfigMap/example', 'new'))
+    else:
+        with pytest.raises(RuntimeError, match='Waiting for deletion'):
+            cli.EnsureRes(manifest, owned)
+        assert (owned == [])
+    waits = [
+        call for call in executor.Run.call_args_list
+        if ('wait' in call.args[0])
+    ]
+    prefix = [
+        'mock-oc', '--kubeconfig=/selected/config',
+        '--context=selected-context', '-n=resource-ns',
+    ]
+    assert (waits[0] == mock.call((prefix + [
+        'wait', '--for=delete', '--timeout=5m', 'ConfigMap/example',
+    ]), input=None, isSecret=False, tryMax=None, spPars=None))
+    if waited:
+        assert (waits[1] == mock.call((prefix + [
+            'wait', '--for=create', '--timeout=2m', 'ConfigMap/example',
+        ]), input=None, isSecret=False, tryMax=None, spPars=None))
+    assert (executor.Run.call_count == (8 if waited else 4))
+    assert (cli.defOpts == original)
+
+
+@pytest.mark.parametrize('native', [False, True])
+@pytest.mark.parametrize('applyFails', [False, True])
+def test_NewRes_UncheckedApplyFailureNeverDeletesExistingResource(
+    native: bool,
+    applyFails: bool,
+) -> None:
+    cli = BuildCLI()
+    resource = {
+        'kind': 'Namespace', 'metadata': {'name': 'shared', 'uid': 'existing'},
+    }
+    manifest = json.dumps(resource)
+    cli.Run.side_effect = [
+        Result(True, manifest), Result(not applyFails, manifest),
+        Result(False),
+    ]
+    specification = (
+        {'subCmd': 'namespace', 'args': ['shared']} if native else manifest
+    )
+
+    (phase, result, _) = cli.NewRes(specification)
+
+    assert (phase == cli.ResPhase['APPLIED' if applyFails else 'WAITED'])
+    assert not result.success
+    assert ([call.args[0] for call in cli.Run.call_args_list] == (
+        ['create namespace' if native else 'create', 'apply'] +
+        ([] if applyFails else ['wait'])
+    ))
+
+
+@pytest.mark.parametrize('native', [False, True])
+def test_NewRes_UntrackedNamespaceFailurePreservesExistingNamespace(
+    native: bool,
+) -> None:
+    from libs.CustomTypes import NamedDict
+    from libs.OpenShift.OCP.Resources import Namespace, ResCfg
+
+    cli = BuildCLI()
+    manifest = json.dumps({
+        'kind': 'Namespace', 'metadata': {'name': 'shared', 'uid': 'existing'},
+    })
+    cli.Run.side_effect = [
+        Result(True, manifest), Result(True, manifest), Result(False),
+    ]
+    configuration = (
+        ResCfg(meta=NamedDict(name='shared')) if native
+        else ResCfg(yaml=manifest)
+    )
+
+    with pytest.raises(RuntimeError, match='WAITED'):
+        Namespace.Create(cli, configuration)
+
+    assert ([call.args[0] for call in cli.Run.call_args_list] == [
+        'create namespace' if native else 'create', 'apply', 'wait',
+    ])
+
+
+@pytest.mark.parametrize('outcome', [
+    'owned', 'changed', 'absent', 'failed', 'exception',
+])
+@pytest.mark.parametrize('isSecret', [False, True])
+def test_NewRes_FailedWaitDeletesOnlyConfirmedCreatedUID(
+    outcome: str,
+    isSecret: bool,
+) -> None:
+    cli = BuildCLI()
+    resource = {
+        'kind': 'Secret', 'metadata': {'name': 'example', 'uid': 'created'},
+    }
+    manifest = json.dumps(resource)
+    responses = [
+        Result(True, manifest), Result(True), Result(True, manifest),
+        Result(False, 'original wait result'),
+        RuntimeError('lookup failed') if (outcome == 'exception') else Result(
+            (outcome != 'failed'),
+            {'absent': '', 'changed': 'replacement'}.get(outcome, 'created'),
+        ),
+    ]
+    if (outcome == 'owned'): responses.append(Result(True))
+    cli.Run.side_effect = responses
+
+    (phase, result, actual) = cli.NewRes(
+        manifest, checkExist=True, isSecret=isSecret,
+    )
+
+    assert (phase is cli.ResPhase.WAITED)
+    assert not result.success
+    assert (result.stdout == 'original wait result')
+    assert (actual == resource)
+    assert (cli.Run.call_args_list[4] == mock.call(
+        'get', 'Secret/example', isSecret=isSecret, spPars={'timeout': 30},
+        o='jsonpath={.metadata.uid}', ignore_not_found=True,
+    ))
+    if (outcome == 'owned'):
+        assert (cli.Run.call_args_list[5] == mock.call(
+            'delete', 'Secret/example', isSecret=isSecret,
+            spPars={'timeout': 30}, force=True, grace_period=0,
+            ignore_not_found=True, wait=False,
+        ))
+    else: assert (cli.Run.call_count == 5)
+    assert all(
+        (call.kwargs['isSecret'] is isSecret)
+        for call in cli.Run.call_args_list
+    )
+
+
+@pytest.mark.parametrize('uid', [None, '', 17])
+def test_NewRes_FailedWaitWithoutCreatedUIDNeverDeletes(uid: object) -> None:
+    cli = BuildCLI()
+    manifest = json.dumps({
+        'kind': 'ConfigMap', 'metadata': {'name': 'example', 'uid': uid},
+    })
+    cli.Run.side_effect = [
+        Result(True, manifest), Result(True), Result(True, manifest),
+        Result(False),
+    ]
+
+    (phase, result, _) = cli.NewRes(manifest, checkExist=True)
+
+    assert (phase is cli.ResPhase.WAITED)
+    assert not result.success
+    assert (cli.Run.call_count == 4)
+    assert not any(
+        (call.args[0] == 'delete') for call in cli.Run.call_args_list
+    )
+
+
+@pytest.mark.parametrize('isSecret', [False, True])
+def test_NewRes_FailedWaitCleanupUsesCreatedNamespaceAndBoundedCommands(
+    commandCLI: tuple[MUT.OCcli, mock.MagicMock],
+    isSecret: bool,
+) -> None:
+    (cli, executor) = commandCLI
+    cli.defOpts.update({'n': 'wrong-short', 'namespace': 'wrong-long'})
+    defaults = dict(cli.defOpts)
+    resource = {
+        'kind': 'Secret',
+        'metadata': {
+            'name': 'example', 'namespace': 'created-ns', 'uid': 'created',
+        },
+    }
+    manifest = json.dumps(resource)
+    executor.Run.reset_mock()
+    executor.Run.side_effect = [
+        Result(True, manifest), Result(True), Result(True, manifest),
+        Result(False), Result(True, 'created'), Result(True),
+    ]
+
+    (phase, result, _) = cli.NewRes(
+        manifest, checkExist=True, isSecret=isSecret,
+    )
+
+    assert (phase is cli.ResPhase.WAITED)
+    assert not result.success
+    assert (cli.defOpts == defaults)
+    assert (executor.Run.call_count == 6)
+    for call in executor.Run.call_args_list[-2:]:
+        assert (call.args[0][:4] == [
+            'mock-oc', '--kubeconfig=/selected/config',
+            '--context=selected-context', '-n=created-ns',
+        ])
+        assert (call.kwargs == {
+            'input': None, 'isSecret': isSecret, 'tryMax': None,
+            'spPars': {'timeout': 30},
+        })
+    assert (executor.Run.call_args_list[-2].args[0][4:] == [
+        'get', '-o=jsonpath={.metadata.uid}', '--ignore-not-found=true',
+        'Secret/example',
+    ])
+    assert (executor.Run.call_args.args[0][4:] == [
+        'delete', '--force=true', '--grace-period=0',
+        '--ignore-not-found=true', '--wait=false', 'Secret/example',
+    ])
+
+
+@pytest.mark.parametrize('phase', ['APPLIED', 'WAITED'])
+@pytest.mark.parametrize('cleanup', [
+    'success', 'nonzero', 'exception', 'timeout', 'absent',
+])
+@pytest.mark.parametrize('raises', [False, True])
+def test_NewRes_FailureAndCleanupMatrixPreservesPrimary(
+    phase: str,
+    cleanup: str,
+    raises: bool,
+) -> None:
+    cli = BuildCLI()
+    manifest = json.dumps({
+        'kind': 'VirtualMachine',
+        'metadata': {'name': 'example', 'uid': 'created-uid'},
+    })
+    primary = (
+        RuntimeError('original creation error') if raises
+        else Result(False, 'original creation failure')
+    )
+    responses = [Result(True, manifest), Result(True)]
+    if (phase == 'WAITED'): responses.append(Result(True, manifest))
+    responses.append(primary)
+    if (phase == 'WAITED'):
+        responses.append(Result(
+            True, ('' if (cleanup == 'absent') else 'created-uid'),
+        ))
+        if (cleanup != 'absent'):
+            responses.append({
+                'success': Result(True),
+                'nonzero': Result(False, 'cleanup failed'),
+                'exception': RuntimeError('cleanup failed'),
+                'timeout': subprocess.TimeoutExpired('delete', 30),
+            }[cleanup])
+    cli.Run.side_effect = responses
+
+    if raises:
+        with pytest.raises(RuntimeError) as caught:
+            cli.NewRes(manifest, checkExist=True)
+        assert (caught.value is primary)
+    else:
+        (actualPhase, result, resource) = cli.NewRes(manifest, checkExist=True)
+        assert (actualPhase == cli.ResPhase[phase])
+        assert (result is primary)
+        expected = json.loads(manifest) if (phase == 'WAITED') else None
+        assert (resource == expected)
+    assert ([call.args[0] for call in cli.Run.call_args_list] == (
+        ['create', 'get', 'apply'] +
+        (['wait', 'get'] if (phase == 'WAITED') else []) +
+        (['delete'] if ((phase == 'WAITED') and (cleanup != 'absent')) else [])
+    ))

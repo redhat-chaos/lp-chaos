@@ -13,6 +13,64 @@ from libs.OpenShift.OCP.CLI.OC import OCcli
 import Utils
 
 
+@pytest.mark.parametrize('count,scaleNodes,workerNode', [
+    (2, None, 'configured-worker'), (2, '', 'configured-worker'),
+    (2, "['worker-a']", None), (2, 'raw-nodes', 'configured-worker'),
+    (2, ' \t', 'configured-worker'),
+    (0, None, None), (0, '', None), (1, None, None), (1, '', None),
+])
+def test_VMcreateByBR_DirectScaleNodes_ReviewRegression(
+    monkeypatch: pytest.MonkeyPatch,
+    count: int,
+    scaleNodes: str | None,
+    workerNode: str | None,
+) -> None:
+    if (scaleNodes is None): monkeypatch.delenv('SCALE_NODES', raising=False)
+    else: monkeypatch.setenv('SCALE_NODES', scaleNodes)
+    monkeypatch.setenv('WORKER_NODE', 'ambient-worker')
+    runner = BenchmarkRunnerVenv('/synthetic/artifacts')
+    PatchRunner(monkeypatch, runner)
+    monkeypatch.setattr(MUT, 'VM', mock.Mock())
+    monkeypatch.setattr(OCcli, 'GetResUID', mock.Mock(side_effect=[
+        *((True, '', ''),) * count,
+        *((True, f'uid-{idx}', '') for idx in range(count)),
+    ]))
+    ocFactory = mock.Mock()
+    brEnv = {'SCALE_NODES': 'configured-nodes'}
+    if (workerNode is not None): brEnv['WORKER_NODE'] = workerNode
+    cfg = MUT._DEF__FXT_CFG | NamedDict(fxtInf=NamedDict(brCfg=NamedDict(
+        count=count, startVM=False, brEnv=brEnv,
+    )))
+    params = MUT.FuncParsVMcreateByBR(fxtCfgObj=cfg)
+    if ((count > 1) and (scaleNodes in (None, ''))):
+        with pytest.raises(ValueError) as caught:
+            MUT.VMcreateByBR(
+                None, params, ocCLI=ocFactory, virtCtlCLI=mock.Mock(),
+            )
+        assert (
+            str(caught.value) == (
+                'Env. Var. `SCALE_NODES` must set to non-empty string for '
+                'scale.'
+            )
+        )
+        runner.call.assert_not_called()
+        ocFactory.assert_not_called()
+        return
+    result = MUT.VMcreateByBR(
+        None, params, ocCLI=ocFactory, virtCtlCLI=mock.Mock(),
+    )
+    assert (len(result) == count)
+    if not count:
+        runner.call.assert_not_called()
+        ocFactory.assert_not_called()
+        return
+    env = runner.call.call_args.kwargs['envUpd']
+    assert (env['SCALE_NODES'] == (scaleNodes if (count > 1) else ''))
+    assert (env['SCALE'] == (str(count) if (count > 1) else ''))
+    if (workerNode is None): assert ('WORKER_NODE' not in env)
+    else: assert (env['WORKER_NODE'] == workerNode)
+
+
 class BenchmarkRunnerVenv:
     def __init__(self, artifactsPath: str) -> None:
         self.artifactsPath = artifactsPath
@@ -32,7 +90,9 @@ def test__DEF__FXT_CFG_UsesNestedWorkloadConfiguration() -> None:
     cfg = MUT._DEF__FXT_CFG
     assert (cfg.fxtInf.brCfg == NamedDict(
         count=1, startVM=True, wlName='windows', wlKind='vm', brEnv={},
-        timeout=NamedDict(vmStart='15m', vmRemove='5m'),
+        timeout=NamedDict(
+            brExecOH=30, brExecVM=5, vmStart='15m', vmRemove='5m',
+        ),
     ))
     assert ('wlName' not in cfg)
     assert ('wlKind' not in cfg)
@@ -51,6 +111,7 @@ def test_FxtVMbyBR_StartTracksOwnershipAndPreservesFailures(
     outcome: str,
     customTimeout: str | None,
 ) -> None:
+    monkeypatch.setenv('SCALE_NODES', "['synthetic-worker']")
     Utils.AutoPatch(monkeypatch, OCcli, 'GetResUID')
     Utils.AutoPatch(monkeypatch, MUT, 'VM')
     Utils.AutoPatch(monkeypatch, MUT, 'uuid4')
@@ -170,7 +231,10 @@ def test_FxtVMbyBR_RetainsSetupAndIsolatesTemporaryOverrides(
         'ns': 'setup-ns',
         'kCfg': '/setup/kubeconfig',
         'cliCfg': NamedDict(
-            ocCfg={'context': 'setup-context'},
+            ocCfg={
+                'context': 'setup-context',
+                'kubeconfig': '/setup-oc-config',
+            },
             vcCfg={'kubeconfig': '/setup-config'},
         ),
         'fxtInf': NamedDict(
@@ -215,9 +279,9 @@ def test_FxtVMbyBR_RetainsSetupAndIsolatesTemporaryOverrides(
 
     assert (bundle.vmList == (first + second + third))
     assert (runner.venv.call_args_list == [
-        mock.call(MUT.Path('/call/br-venv')),
-        mock.call(MUT.Path('/setup/br-venv')),
-        mock.call(MUT.Path('/setup/br-venv')),
+        mock.call(MUT.Path('/call/br-venv'), execTO=2100),
+        mock.call(MUT.Path('/setup/br-venv'), execTO=2100),
+        mock.call(MUT.Path('/setup/br-venv'), execTO=2100),
     ])
     environments = [
         call.kwargs['envUpd'] for call in runner.call.call_args_list
@@ -229,14 +293,23 @@ def test_FxtVMbyBR_RetainsSetupAndIsolatesTemporaryOverrides(
         'call-ns', 'setup-ns', 'setup-ns',
     ])
     assert (ocFactory.call_args_list == [
-        mock.call(ns='call-ns', context='call-context'),
-        mock.call(ns='setup-ns', context='setup-context'),
-        mock.call(ns='setup-ns', context='setup-context'),
+        mock.call(
+            ns='call-ns', context='call-context',
+            kubeconfig='/call/kubeconfig',
+        ),
+        mock.call(
+            ns='setup-ns', context='setup-context',
+            kubeconfig='/setup/kubeconfig',
+        ),
+        mock.call(
+            ns='setup-ns', context='setup-context',
+            kubeconfig='/setup/kubeconfig',
+        ),
     ])
     assert (virtCtlFactory.call_args_list == [
-        mock.call(ns='call-ns', kubeconfig='/setup-config'),
-        mock.call(ns='setup-ns', kubeconfig='/setup-config'),
-        mock.call(ns='setup-ns', kubeconfig='/setup-config'),
+        mock.call(ns='call-ns', kubeconfig='/call/kubeconfig'),
+        mock.call(ns='setup-ns', kubeconfig='/setup/kubeconfig'),
+        mock.call(ns='setup-ns', kubeconfig='/setup/kubeconfig'),
     ])
     assert ([call.kwargs['sshUsr'] for call in MUT.VM.call_args_list] == [
         'call-user', 'setup-user', 'setup-user',
@@ -429,8 +502,13 @@ def test_VMcreateByBR_SingleVMhappyPathUsesGeneratedIdentityKey(
     assert (environment['UUID'] == str(MUT.uuid4.return_value))
     assert (environment['KUBECONFIG'] == MUT._DEF__FXT_CFG.kCfg)
     assert (environment['RUN_ARTIFACTS_PATH'] == '/artifacts')
-    ocFactory.assert_called_once_with(ns='default', context='oc-context')
-    virtCtlFactory.assert_called_once_with(ns='default')
+    ocFactory.assert_called_once_with(
+        ns='default', context='oc-context',
+        kubeconfig=MUT._DEF__FXT_CFG.kCfg,
+    )
+    virtCtlFactory.assert_called_once_with(
+        ns='default', kubeconfig=MUT._DEF__FXT_CFG.kCfg,
+    )
     MUT.VM.assert_called_once_with(
         name='windows-vm-12345678',
         ns='default',
@@ -440,7 +518,9 @@ def test_VMcreateByBR_SingleVMhappyPathUsesGeneratedIdentityKey(
         sshKey='/artifacts/ssh/vm_key',
     )
 
-    runner.venv.assert_called_once_with(MUT.Path('/custom/br-venv'))
+    runner.venv.assert_called_once_with(
+        MUT.Path('/custom/br-venv'), execTO=2100,
+    )
     runner.call.assert_called_once_with(
         'benchmark_runner.main.main', 'main', envUpd=environment,
     )
@@ -451,6 +531,7 @@ def test_VMcreateByBR_ScalePathNamesVMsAndUsesFallbackKey(
 ) -> None:
     Utils.AutoPatch(monkeypatch, OCcli, 'GetResUID')
     monkeypatch.setenv('WORKER_NODE', 'worker-a')
+    monkeypatch.setenv('SCALE_NODES', "['worker-a']")
     Utils.AutoPatch(monkeypatch, MUT, 'VM')
     Utils.AutoPatch(monkeypatch, MUT, 'uuid4')
     Utils.AutoPatch(monkeypatch, MUT.Path, 'is_file')
@@ -568,12 +649,15 @@ def test_VMcreateByBR_NestedOverridesDoNotMutateDefaults(
         dict(MUT._DEF__FXT_CFG.fxtInf.gstCfg.usrCrd),
     ) == defaultNestedValues)
     assert (ocFactory.call_args_list == [
-        mock.call(ns='default', context='custom-context'),
-        mock.call(ns='default'),
+        mock.call(
+            ns='default', context='custom-context',
+            kubeconfig=MUT._DEF__FXT_CFG.kCfg,
+        ),
+        mock.call(ns='default', kubeconfig=MUT._DEF__FXT_CFG.kCfg),
     ])
     assert (virtCtlFactory.call_args_list == [
-        mock.call(ns='default', kubeconfig='/custom-config'),
-        mock.call(ns='default'),
+        mock.call(ns='default', kubeconfig=MUT._DEF__FXT_CFG.kCfg),
+        mock.call(ns='default', kubeconfig=MUT._DEF__FXT_CFG.kCfg),
     ])
     assert (MUT.VM.call_args_list[0].kwargs['sshUsr'] == 'custom-user')
     assert (MUT.VM.call_args_list[0].kwargs['sshKey'] == (
@@ -645,6 +729,7 @@ def test_VMcreateByBR_RunnerFailurePreservesPrimaryErrorDuringReconciliation(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    monkeypatch.setenv('SCALE_NODES', "['synthetic-worker']")
     Utils.AutoPatch(monkeypatch, OCcli, 'GetResUID')
     Utils.AutoPatch(monkeypatch, MUT, 'VM')
     Utils.AutoPatch(monkeypatch, MUT, 'uuid4')
@@ -805,6 +890,7 @@ def test_FxtVMbyBR_InitialSuccessUsesSelectedConfigAndCleansOnClose(
     virtCtlFactory = mock.MagicMock()
     generator = MUT.FxtVMbyBR.__wrapped__(
         request=SimpleNamespace(param={
+            'kCfg': '/initial/kubeconfig',
             'cliCfg': NamedDict(
                 ocCfg={'context': 'initial-context'},
                 vcCfg={'kubeconfig': '/initial-config'},
@@ -824,10 +910,11 @@ def test_FxtVMbyBR_InitialSuccessUsesSelectedConfigAndCleansOnClose(
     ocFactory.assert_called_once_with(
         ns='initial-ns',
         context='initial-context',
+        kubeconfig='/initial/kubeconfig',
     )
     virtCtlFactory.assert_called_once_with(
         ns='initial-ns',
-        kubeconfig='/initial-config',
+        kubeconfig='/initial/kubeconfig',
     )
     generator.close()
     MUT.VM.CleanUpVMs.assert_called_once_with(
@@ -840,6 +927,7 @@ def test_FxtVMbyBR_InitialSuccessUsesSelectedConfigAndCleansOnClose(
 def test_FxtVMbyBR_PerCallReturnsAreAggregatedAcrossBatches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv('SCALE_NODES', "['synthetic-worker']")
     Utils.AutoPatch(monkeypatch, OCcli, 'GetResUID')
     Utils.AutoPatch(monkeypatch, MUT, 'VM')
     Utils.AutoPatch(monkeypatch, MUT, 'uuid4')
@@ -924,6 +1012,7 @@ def test_FxtVMbyBR_VMcreateAllowsCLIOverrides(
 
     created = bundle.vmCreate(
         ns='selected-ns',
+        kCfg='/selected/kubeconfig',
         cliCfg=NamedDict(
             ocCfg={'context': 'selected-context'},
             vcCfg={'kubeconfig': '/selected-config'},
@@ -937,10 +1026,11 @@ def test_FxtVMbyBR_VMcreateAllowsCLIOverrides(
     selectedOC.assert_called_once_with(
         ns='selected-ns',
         context='selected-context',
+        kubeconfig='/selected/kubeconfig',
     )
     selectedVirtCtl.assert_called_once_with(
         ns='selected-ns',
-        kubeconfig='/selected-config',
+        kubeconfig='/selected/kubeconfig',
     )
     defaultOC.assert_not_called()
     defaultVirtCtl.assert_not_called()
@@ -984,6 +1074,7 @@ def test_FxtVMbyBR_VMcreateRejectsInternalKeywordReplacementBeforeOperations(
 def test_FxtVMbyBR_PreyieldPartialFailureCleansCreatedVMs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv('SCALE_NODES', "['synthetic-worker']")
     Utils.AutoPatch(monkeypatch, OCcli, 'GetResUID')
     Utils.AutoPatch(monkeypatch, MUT, 'VM')
     Utils.AutoPatch(monkeypatch, MUT, 'uuid4')
@@ -1026,6 +1117,7 @@ def test_FxtVMbyBR_PreyieldPartialFailureCleansCreatedVMs(
 def test_FxtVMbyBR_LaterPartialFailureCleansAggregateOnClose(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv('SCALE_NODES', "['synthetic-worker']")
     Utils.AutoPatch(monkeypatch, OCcli, 'GetResUID')
     Utils.AutoPatch(monkeypatch, MUT, 'VM')
     Utils.AutoPatch(monkeypatch, MUT, 'uuid4')
@@ -1187,3 +1279,142 @@ def test_FxtVMbyBR_TestFailurePreservesPrimaryWhenCleanupFails(
         optsCleanUpRes={'optsDelRes': {'waitTime': '5m'}},
     )
     assert ('Could not clean up fixture VMs: cleanup failure' in caplog.text)
+
+
+@pytest.mark.parametrize(('count', 'overhead', 'perVM'), [
+    (0, 30, 5), (1, 30, 5), (4, 30, 5), (2, 1, 2),
+    (0, 0, 0),
+])
+def test_VMcreateByBR_ScalesExecutionBudgetAndConvertsMinutes(
+    monkeypatch: pytest.MonkeyPatch,
+    count: int,
+    overhead: int,
+    perVM: int,
+) -> None:
+    monkeypatch.setenv('SCALE_NODES', "['synthetic-worker']")
+    Utils.AutoPatch(monkeypatch, OCcli, 'GetResUID')
+    OCcli.GetResUID.return_value = (True, '', '')
+    runner = BenchmarkRunnerVenv('/tmp')
+    primary = TimeoutError('stop after recording runner budget')
+    runner.call.side_effect = primary
+    PatchRunner(monkeypatch, runner)
+    factory = mock.MagicMock()
+    overrides = {'fxtInf': NamedDict(brCfg=NamedDict(
+        count=count, timeout=NamedDict(brExecOH=overhead, brExecVM=perVM),
+    ))}
+    defaults = json.loads(json.dumps(MUT._DEF__FXT_CFG, default=str))
+
+    def Create() -> list[object]:
+        return MUT.VMcreateByBR(
+            SimpleNamespace(), MUT.FuncParsVMcreateByBR(MUT._DEF__FXT_CFG),
+            ocCLI=factory, virtCtlCLI=mock.MagicMock(), **overrides,
+        )
+
+    if count:
+        with pytest.raises(TimeoutError) as raised:
+            Create()
+        assert (raised.value is primary)
+        runner.venv.assert_called_once_with(
+            MUT._DEF__FXT_CFG.fxtInf.rootPath.br,
+            execTO=(60 * (overhead + (count * perVM))),
+        )
+        assert (type(runner.venv.call_args.kwargs['execTO']) is int)
+    else:
+        assert (Create() == [])
+        runner.venv.assert_not_called()
+        factory.assert_not_called()
+    assert (json.loads(json.dumps(MUT._DEF__FXT_CFG, default=str)) == defaults)
+
+
+@pytest.mark.parametrize('field', ['brExecOH', 'brExecVM'])
+@pytest.mark.parametrize('value', [
+    0, -1, True, False, 1.5, 0.25, '5', None,
+    float('nan'), float('inf'), float('-inf'),
+])
+def test_VMcreateByBR_RejectsInvalidExecutionAllowanceBeforeOperations(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    runner = BenchmarkRunnerVenv('/tmp')
+    PatchRunner(monkeypatch, runner)
+    factory = mock.MagicMock()
+
+    with pytest.raises(
+        ValueError, match=f'The `{field}` must be a positive integer',
+    ):
+        MUT.VMcreateByBR(
+            SimpleNamespace(), MUT.FuncParsVMcreateByBR(MUT._DEF__FXT_CFG),
+            ocCLI=factory, virtCtlCLI=mock.MagicMock(),
+            fxtInf=NamedDict(brCfg=NamedDict(
+                timeout=NamedDict({field: value}),
+            )),
+        )
+
+    runner.venv.assert_not_called()
+    factory.assert_not_called()
+
+
+def test_VMcreateByBR_RejectsZeroTotalExecutionBudget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = BenchmarkRunnerVenv('/tmp')
+    PatchRunner(monkeypatch, runner)
+    factory = mock.MagicMock()
+
+    with pytest.raises(
+        ValueError, match='The `brExecOH` must be a positive integer',
+    ):
+        MUT.VMcreateByBR(
+            SimpleNamespace(), MUT.FuncParsVMcreateByBR(MUT._DEF__FXT_CFG),
+            ocCLI=factory, virtCtlCLI=mock.MagicMock(),
+            fxtInf=NamedDict(brCfg=NamedDict(timeout=NamedDict(
+                brExecOH=0, brExecVM=0,
+            ))),
+        )
+
+    runner.venv.assert_not_called()
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize('cleanupFails', [False, True])
+def test_FxtVMbyBR_RunnerTimeoutReconcilesAndCleansPartialVMs(
+    monkeypatch: pytest.MonkeyPatch,
+    cleanupFails: bool,
+) -> None:
+    monkeypatch.setenv('SCALE_NODES', "['synthetic-worker']")
+    Utils.AutoPatch(monkeypatch, OCcli, 'GetResUID')
+    Utils.AutoPatch(monkeypatch, MUT, 'VM')
+    Utils.AutoPatch(monkeypatch, MUT, 'uuid4')
+    MUT.uuid4.return_value = 'timeout-rest'
+    OCcli.GetResUID.side_effect = [
+        (True, '', ''), (True, '', ''),
+        (True, 'partial-uid', ''), (True, '', ''),
+    ]
+    runner = BenchmarkRunnerVenv('/tmp')
+    primary = TimeoutError('runner exceeded its execution budget')
+    runner.call.side_effect = primary
+    PatchRunner(monkeypatch, runner)
+    if cleanupFails:
+        MUT.VM.CleanUpVMs.side_effect = RuntimeError('cleanup failed')
+    clients = [mock.MagicMock(), mock.MagicMock()]
+    factory = mock.MagicMock(side_effect=clients)
+    generator = MUT.FxtVMbyBR.__wrapped__(
+        SimpleNamespace(param={'fxtInf': NamedDict(brCfg=NamedDict(count=2))}),
+        factory, mock.MagicMock(),
+    )
+
+    with pytest.raises(TimeoutError) as raised:
+        next(generator)
+
+    assert (raised.value is primary)
+    runner.venv.assert_called_once_with(
+        MUT._DEF__FXT_CFG.fxtInf.rootPath.br, execTO=2400,
+    )
+    MUT.VM.assert_not_called()
+    MUT.VM.CleanUpVMs.assert_called_once_with(
+        [], [
+            (clients[0], 'VirtualMachine/windows-vm-timeout-0', 'partial-uid'),
+        ],
+        optsCleanUpRes={'optsDelRes': {'waitTime': '5m'}},
+    )

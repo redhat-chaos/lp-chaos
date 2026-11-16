@@ -30,6 +30,99 @@ from libs.Utils.CmdExec import CmdRes
 import Utils
 
 
+@pytest.mark.parametrize('private', ['', ' \t', '$UNIT_EMPTY_KEY'])
+def test__ResolveSSHkeys_BlankExpandedPrivate_ReviewRegression(
+    monkeypatch: pytest.MonkeyPatch,
+    private: str,
+) -> None:
+    monkeypatch.setenv('UNIT_EMPTY_KEY', '')
+    executor = mock.Mock()
+    monkeypatch.setattr(MUT, 'CmdExec', executor)
+    cfg = MUT._DEF__FXT_CFG | NamedDict(fxtInf=NamedDict(gstCfg=NamedDict(
+        usrCrd=NamedDict(sshKey=NamedDict(prv=private, pub='literal.pub')),
+    )))
+    with pytest.raises(ValueError, match='can not be empty'):
+        MUT._ResolveSSHkeys(cfg, [])
+    executor.assert_not_called()
+
+
+@pytest.mark.usefixtures('localPreparation')
+@pytest.mark.parametrize('ocConfig,vcConfig', [
+    ({}, {}),
+    ({'kubeconfig': 'oc-explicit'}, {'kubeconfig': 'vc-explicit'}),
+])
+def test_VMcreate_ClientKubeconfig_ReviewRegression(
+    monkeypatch: pytest.MonkeyPatch,
+    ocConfig: dict,
+    vcConfig: dict,
+) -> None:
+    monkeypatch.setattr(OCcli, 'GetResUID', mock.Mock(
+        return_value=(True, 'reuse-uid', ''),
+    ))
+    monkeypatch.setattr(MUT, 'VM', mock.Mock())
+    monkeypatch.setattr(MUT.Namespace, 'Create', mock.Mock())
+    cfg = MUT._DEF__FXT_CFG | NamedDict(
+        kCfg='fixture-config',
+        cliCfg=NamedDict(ocCfg=ocConfig, vcCfg=vcConfig),
+        fxtInf=NamedDict(vmCfg=NamedDict(reuseExisting=True, startVM=False)),
+    )
+    ocFactory = mock.Mock()
+    vcFactory = mock.Mock()
+    MUT.VMcreate(
+        Request(), MUT.FuncParsVMcreate(fxtCfgObj=cfg),
+        ocCLI=ocFactory, virtCtlCLI=vcFactory,
+    )
+    ocFactory.assert_called_once_with(
+        ns=cfg.ns, kubeconfig=cfg.kCfg,
+    )
+    vcFactory.assert_called_once_with(
+        ns=cfg.ns, kubeconfig=cfg.kCfg,
+    )
+
+
+@pytest.mark.parametrize('override', ['private-only', 'pair', 'unchanged'])
+def test_VMcreate_PrivateOverridePublicIdentity_ReviewRegression(
+    localContext: SimpleNamespace,
+    override: str,
+) -> None:
+    state = localContext
+    keyDirs = state.sshKeyDirs
+    base = MUT._ResolveSSHkeys(
+        MUT._DEF__FXT_CFG | NamedDict(_REGISTERED_CFG) | NamedDict(
+            fxtInf=NamedDict(vmCfg=NamedDict(ctxData={})),
+        ),
+        keyDirs,
+    )
+    before = ConfigSnapshot(base)
+    alternate = state.keyPath.parent / 'alternate-key'
+    alternate.write_text('unit-private-ed25519')
+    explicit = alternate.with_suffix('.pub')
+    explicit.write_text('ssh-ed25519 explicit-pair\n')
+    keys = NamedDict(prv=(
+        base.fxtInf.gstCfg.usrCrd.sshKey.prv if (override == 'unchanged')
+        else str(alternate)
+    ))
+    if (override == 'pair'): keys |= NamedDict(pub=str(explicit))
+    params = MUT.FuncParsVMcreate(fxtCfgObj=base, sshKeyDirs=keyDirs)
+    vms = MUT.VMcreate(
+        state.request, params, ocCLI=state.ocFactory,
+        virtCtlCLI=mock.Mock(),
+        fxtInf=NamedDict(gstCfg=NamedDict(usrCrd=NamedDict(sshKey=keys))),
+    )
+    expected = (
+        state.publicKey if (override == 'unchanged')
+        else (
+            'ssh-ed25519 explicit-pair\n' if (override == 'pair')
+            else 'ssh-ed25519 unit-public-alternate-key\n'
+        )
+    )
+    assert (base64.b64encode(expected.encode()).decode() in (
+        yaml.safe_dump(state.resources[-1])
+    ))
+    assert (vms[0].sshKey == keys.prv)
+    assert (ConfigSnapshot(base) == before)
+
+
 @pytest.mark.usefixtures('localPreparation')
 def test_VMcreate_ResourceHandlersReceiveNamedDictAndSharedOwnership(
     monkeypatch: pytest.MonkeyPatch,
@@ -81,63 +174,49 @@ def test_VMcreate_ResourceHandlersReceiveNamedDictAndSharedOwnership(
 
 
 @pytest.mark.usefixtures('localPreparation')
-@pytest.mark.parametrize('phase', ['APPLIED', 'WAITED'])
-@pytest.mark.parametrize('cleanup', [
-    'success', 'nonzero', 'exception', 'timeout', 'absent',
-])
-@pytest.mark.parametrize('raises', [False, True])
-def test_VMcreate_FailedCreationStopsBatchDespiteCleanupOutcome(
+@pytest.mark.parametrize('errorType', [RuntimeError, ValueError])
+def test_VMcreate_FailedCreationStopsBatchAndPreservesError(
     monkeypatch: pytest.MonkeyPatch,
-    phase: str,
-    cleanup: str,
-    raises: bool,
+    errorType: type[Exception],
 ) -> None:
-    Utils.AutoPatch(monkeypatch, OCcli, 'GetResUID')
     Utils.AutoPatch(monkeypatch, MUT.Namespace, 'Create')
     Utils.AutoPatch(monkeypatch, MUT.Secret, 'Create')
+    Utils.AutoPatch(monkeypatch, MUT.VirtualMachine, 'Create')
     Utils.AutoPatch(monkeypatch, MUT.YAMLcfg, 'Render')
     Utils.AutoPatch(monkeypatch, MUT, 'VM')
-    OCcli.GetResUID.return_value = (True, '', '')
-    MUT.YAMLcfg.Render.side_effect = RenderVM
-    client = OCmock()
-    manifest = RenderVM(Path('unused'), {'vmName': 'example'})
-    primary = (
-        RuntimeError('original creation error') if raises
-        else CommandResult(False, 'original creation failure')
-    )
-    responses = [ResourceResult(json.loads(manifest)), CommandResult(True)]
-    if (phase == 'WAITED'):
-        responses.append(ResourceResult(json.loads(manifest)))
-    responses.append(primary)
-    responses.append({
-        'success': CommandResult(True),
-        'nonzero': CommandResult(False, 'cleanup failed'),
-        'exception': RuntimeError('cleanup failed'),
-        'timeout': subprocess.TimeoutExpired('delete', 30),
-        'absent': CommandResult(True),
-    }[cleanup])
-    client.Run.side_effect = responses
-    client.NewRes = mock.Mock(side_effect=lambda *args, **kwargs:
-                              OCcli.NewRes(client, *args, **kwargs))
+    MUT.YAMLcfg.Render.return_value = 'synthetic VM manifest'
+    client = mock.create_autospec(OCcli, instance=True)
+    client.GetResUID.return_value = (True, '', '')
+    unexpected = AssertionError('OC lifecycle is outside this unit')
+    client.Run.side_effect = unexpected
+    client.NewRes.side_effect = unexpected
+    client.EnsureRes.side_effect = unexpected
+    primary = errorType('original creation error')
+    MUT.VirtualMachine.Create.side_effect = primary
     params = MUT.FuncParsVMcreate(fxtCfgObj=(MUT._DEF__FXT_CFG | NamedDict(
         fxtInf=NamedDict(vmCfg=NamedDict(ctxData={}, count=2)),
     )))
+    vmTO = params.fxtCfgObj.fxtInf.vmCfg.timeout.vmCreate
     factory = mock.Mock(return_value=client)
     virtCtl = mock.Mock()
-    with pytest.raises(RuntimeError) as caught:
+
+    with pytest.raises(errorType) as caught:
         MUT.VMcreate(Request(), params, ocCLI=factory, virtCtlCLI=virtCtl)
-    if raises: assert (caught.value is primary)
-    else: assert (str(caught.value) == f'`EnsureRes()`: Failed at `{phase}`.')
+
+    assert (caught.value is primary)
     factory.assert_called_once()
-    client.NewRes.assert_called_once()
+    MUT.VirtualMachine.Create.assert_called_once_with(
+        client, MUT.ResCfg(yaml='synthetic VM manifest'),
+        MUT.OwnInf(owned=params.ownResTrk.VMs),
+        optsNewRes={'waitTime': vmTO},
+    )
+    client.Run.assert_not_called()
+    client.NewRes.assert_not_called()
+    client.EnsureRes.assert_not_called()
     MUT.YAMLcfg.Render.assert_called_once()
     MUT.VM.assert_not_called()
     virtCtl.assert_not_called()
     assert (params.vmList == params.ownResTrk.VMs == [])
-    assert ([call.args[0] for call in client.Run.call_args_list] == (
-        ['create', 'get', 'apply'] +
-        (['wait'] if (phase == 'WAITED') else []) + ['delete']
-    ))
 
 
 @pytest.mark.usefixtures('localPreparation')
@@ -378,9 +457,7 @@ def test_VMcreate_ContextMergesCustomFieldsAndGeneratesManagedFields(
 
 
 @pytest.mark.parametrize('context', [NamedDict(), [], 'invalid', 1, False])
-def test_VMcreate_DefaultContextRejectsMismatchedTypes(
-    context: Any,
-) -> None:
+def test_VMcreate_DefaultContextRejectsMismatchedTypes(context: Any) -> None:
     params = MUT.FuncParsVMcreate(fxtCfgObj=MUT._DEF__FXT_CFG)
     ocFactory = mock.Mock()
     with pytest.raises(TypeError, match=(
@@ -781,8 +858,7 @@ def test_VMcreate_InlineSecretThroughActualCLI(
             owners.append(owned)
         return originalEnsure(client, specification, owned, **kwargs)
 
-    def Open(path: Any, flags: int, mode: int = 0o777,
-             **kwargs: Any) -> int:
+    def Open(path: Any, flags: int, mode: int = 0o777, **kwargs: Any) -> int:
         descriptor = nativeOpen(path, flags, mode, **kwargs)
         if (flags & MUT.os.O_EXCL):
             file = Path(path)
@@ -930,6 +1006,7 @@ def test_VMcreate_DirectNamespaceDeletionWait(
 def OCmock(name: str | None = None) -> mock.MagicMock:
     client = mock.create_autospec(OCcli, instance=True, name=name)
     client.ResPhase = OCcli.ResPhase
+    client._InNS.return_value = client
     client.EnsureRes.side_effect = lambda *args, **kwargs: OCcli.EnsureRes(
         client, *args, **kwargs
     )
@@ -1251,12 +1328,14 @@ def test_VMcreate_BatchReturnsNewVMsAndAppendsConfirmedOwnership(
         mock.call(Path('/repo/conf/VM/template.yaml'), mock.ANY),
     ])
     assert (ocFactory.call_args_list == [
-        mock.call(ns='default', context='oc-context'),
-        mock.call(ns='default', context='oc-context'),
+        mock.call(ns='default', kubeconfig=MUT._DEF__FXT_CFG.kCfg,
+                  context='oc-context'),
+        mock.call(ns='default', kubeconfig=MUT._DEF__FXT_CFG.kCfg,
+                  context='oc-context'),
     ])
     assert (virtCtlFactory.call_args_list == [
-        mock.call(ns='default', kubeconfig='/virt-kubeconfig'),
-        mock.call(ns='default', kubeconfig='/virt-kubeconfig'),
+        mock.call(ns='default', kubeconfig=MUT._DEF__FXT_CFG.kCfg),
+        mock.call(ns='default', kubeconfig=MUT._DEF__FXT_CFG.kCfg),
     ])
     ocZero.vmNewRes.assert_called_once_with(
         mock.ANY, checkExist=True, isSecret=False, waitTime='4m',
@@ -1534,12 +1613,13 @@ def test_VMcreate_NestedOverridesDoNotMutateDefaults(
         dict(MUT._DEF__FXT_CFG.fxtInf.gstCfg.usrCrd),
     ) == defaultNestedValues)
     assert (ocFactory.call_args_list == [
-        mock.call(ns='default', context='custom'),
-        mock.call(ns='default'),
+        mock.call(ns='default', kubeconfig=MUT._DEF__FXT_CFG.kCfg,
+                  context='custom'),
+        mock.call(ns='default', kubeconfig=MUT._DEF__FXT_CFG.kCfg),
     ])
     assert (virtCtlFactory.call_args_list == [
-        mock.call(ns='default'),
-        mock.call(ns='default'),
+        mock.call(ns='default', kubeconfig=MUT._DEF__FXT_CFG.kCfg),
+        mock.call(ns='default', kubeconfig=MUT._DEF__FXT_CFG.kCfg),
     ])
     assert (MUT.VM.call_args_list[0].kwargs['sshUsr'] == 'custom-user')
     assert (MUT.VM.call_args_list[0].kwargs['sshKey'] == \
@@ -1632,11 +1712,12 @@ def test_FxtVM_InitialSuccessUsesSelectedConfigAndCleansOnClose(
     assert (bundle.vmList == [vm])
     ocFactory.assert_called_once_with(
         ns='initial-ns',
+        kubeconfig=MUT._DEF__FXT_CFG.kCfg,
         context='initial-context',
     )
     virtCtlFactory.assert_called_once_with(
         ns='initial-ns',
-        kubeconfig='/initial-config',
+        kubeconfig=MUT._DEF__FXT_CFG.kCfg,
     )
     MUT.YAMLcfg.Render.assert_called_once_with(
         Path('/repo/conf/VM/initial.yaml'),
@@ -1815,11 +1896,12 @@ def test_FxtVM_VMcreateAllowsCLIOverrides(
     assert (created == [MUT.VM.return_value])
     selectedOC.assert_called_once_with(
         ns='selected-ns',
+        kubeconfig=MUT._DEF__FXT_CFG.kCfg,
         context='selected-context',
     )
     selectedVirtCtl.assert_called_once_with(
         ns='selected-ns',
-        kubeconfig='/selected-config',
+        kubeconfig=MUT._DEF__FXT_CFG.kCfg,
     )
     defaultOC.assert_not_called()
     defaultVirtCtl.assert_not_called()
@@ -2281,12 +2363,16 @@ def test_FxtVM_OwnedResourceLifecycleThroughNativeConsumer(
         assert ('synthetic-delete-failure' in str(caught.value))
     else:
         generator.close()
-    if (case in ('existing-uid-changed', 'namespace-uid-changed')):
+    if (case in (
+        'vm-uid-changed', 'existing-uid-changed', 'namespace-uid-changed',
+    )):
         assert (state.present == {
             'owned-vm-0': 'replacement-vm',
             'owned-vm-1': 'replacement-vm',
         })
-        assert not deletions
+        if (case == 'vm-uid-changed'):
+            assert (deletions == [f'Secret/{name}'])
+        else: assert not deletions
     else:
         assert not state.present
     if (case in ('existing', 'existing-uid-changed', 'namespace-uid-changed')):
@@ -2298,6 +2384,9 @@ def test_FxtVM_OwnedResourceLifecycleThroughNativeConsumer(
     if (case == 'namespace-delete-failed'):
         assert (state.namespaces[ns]['metadata']['uid'] == 'owned-Namespace')
         assert (deletions[-1] == f'Namespace/{ns}')
+    elif (case == 'vm-uid-changed'):
+        assert (state.namespaces[ns]['metadata']['uid'] == 'owned-Namespace')
+        assert ('Retaining `Namespace/context-ns`' in caplog.text)
     elif (case in ('namespace-uid-changed',)):
         assert (
             state.namespaces[ns]['metadata']['uid'] == 'replacement-namespace'
@@ -2486,7 +2575,8 @@ def test_VMcreate_ActualRenderRawS3PublicKeyAndClientContext(
         assert (command[(command.index('--context') + 1)] == 'fixture-context')
         if (command[0] == 'oc-unit'):
             assert (
-                command[(command.index('--kubeconfig') + 1)] == '/mock/config'
+                command[(command.index('--kubeconfig') + 1)] ==
+                state.cfg['kCfg']
             )
     assert all((client.cmdExec is state.recorder) for client in state.clients)
     retained = repr(state.recorder.inputs) + caplog.text
@@ -2543,8 +2633,7 @@ def test_VMcreate_EmptyValuesFailBeforeResourceEffects(
     with pytest.raises(ValueError) as caught:
         Create(state)
     expected = (
-        'Public Key resolution failed'
-        if ((fldPath[-1] == 'prv') and (badValue == ''))
+        'can not be empty' if ((fldPath[-1] == 'prv') and (badValue == ''))
         else fldPath[-1]
     )
     assert (expected in str(caught.value))
@@ -4805,6 +4894,13 @@ def test__ResolveSSHkeys_DotPrivateUsesSuppliedPublicLiterally(
     )
     before = json.dumps(cfg)
 
+    if (prv in ('', '$VMCTX__EMPTY')):
+        with pytest.raises(ValueError, match='can not be empty'):
+            MUT._ResolveSSHkeys(cfg, sshKeyDirs)
+        assert (sshKeyDirs == [])
+        assert (pub.read_bytes() == b' opaque public\r\n')
+        assert (json.dumps(cfg) == before)
+        return
     result = MUT._ResolveSSHkeys(cfg, sshKeyDirs)
 
     assert (result.fxtInf.gstCfg.usrCrd.sshKey.prv == '.')
@@ -4833,6 +4929,13 @@ def test__ResolveSSHkeys_DotPrivateDerivationFailsNatively(
     )
     before = json.dumps(cfg)
 
+    if (prv in ('', '$VMCTX__EMPTY')):
+        with pytest.raises(ValueError, match='can not be empty'):
+            MUT._ResolveSSHkeys(cfg, sshKeyDirs)
+        assert (sshKeyDirs == [])
+        assert (json.dumps(cfg) == before)
+        assert ('Load key' not in caplog.text)
+        return
     with pytest.raises(ValueError, match='Public Key resolution failed'):
         MUT._ResolveSSHkeys(cfg, sshKeyDirs)
 
@@ -4871,6 +4974,17 @@ def test_FxtVM_DotPrivateUsesLiteralPublicAndConsumerIdentity(
     )))
     cfgBefore = json.dumps(override)
     try:
+        if (prv in ('', '$VMCTX__EMPTY')):
+            with pytest.raises(ValueError, match='can not be empty'):
+                bundle.vmCreate(fxtInf=NamedDict(
+                    vmCfg=NamedDict(count=1), gstCfg=override,
+                ))
+            assert (state.resources == [])
+            assert ((state.genCalls, state.keyCalls) == calls)
+            assert (ConfigSnapshot(base) == before)
+            assert (json.dumps(override) == cfgBefore)
+            assert (pub.read_bytes() == text.encode())
+            return
         vm = bundle.vmCreate(
             fxtInf=NamedDict(vmCfg=NamedDict(count=1), gstCfg=override),
         )[0]
@@ -5068,3 +5182,132 @@ def test_FxtVM_MultipleOwnedDirectoriesFollowAllSSHCleanupAndPreservePrimary(
         assert ('synthetic-sensitive-directory-error' not in caplog.text)
     finally:
         generator.close()
+
+
+@pytest.mark.parametrize('case,retained', [
+    ('empty', False),
+    ('whitespace', False),
+    ('present', True),
+    ('failed', True),
+    ('exception', True),
+])
+def test__RetainNS_RequiresConfirmedVMabsence(
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+    retained: bool,
+) -> None:
+    client = OCmock()
+    client.Run.side_effect = None
+    client.Run.return_value = CommandResult(
+        (case != 'failed'),
+        {'whitespace': ' \n', 'present': 'replacement-uid'}.get(case, ''),
+    )
+    if (case == 'exception'):
+        client.Run.side_effect = RuntimeError('synthetic lookup failure')
+
+    assert (MUT._RetainNS(client, 'Namespace/owned-ns') is retained)
+
+    client.Run.assert_called_once_with(
+        'get', 'VirtualMachines', n='owned-ns', namespace=None,
+        o='jsonpath={.items[*].metadata.uid}',
+    )
+    client.DelRes.assert_not_called()
+    if retained: assert ('Retaining `Namespace/owned-ns`' in caplog.text)
+    else: assert ('Retaining' not in caplog.text)
+
+
+@pytest.mark.usefixtures('localPreparation')
+@pytest.mark.parametrize('teardown', ['close', 'resume', 'primary'])
+@pytest.mark.parametrize('case', ['empty', 'present', 'failed', 'exception'])
+def test_FxtVM_RetainsOnlyNamespacesWithoutConfirmedVMabsence(
+    monkeypatch: pytest.MonkeyPatch,
+    teardown: str,
+    case: str,
+) -> None:
+    clients = [OCmock(), OCmock()]
+    first = clients[0]
+    for client in clients:
+        client.Run.side_effect = None
+        client.Run.return_value = CommandResult(True)
+    first.Run.return_value = CommandResult(
+        (case != 'failed'), 'replacement-uid' if (case == 'present') else '',
+    )
+    if (case == 'exception'):
+        first.Run.side_effect = RuntimeError('synthetic lookup failure')
+    records = [
+        (clients[0], 'Namespace/retained-ns', 'first-uid'),
+        (clients[1], 'Namespace/empty-ns', 'second-uid'),
+    ]
+
+    def Create(
+        request: Any,
+        fPars: MUT.FuncParsVMcreate,
+        **kwargs: Any,
+    ) -> list[Any]:
+        fPars.ownResTrk.NSs.extend(records)
+        return []
+
+    monkeypatch.setattr(MUT, 'VMcreate', Create)
+    cleanup = mock.Mock()
+    monkeypatch.setattr(MUT.OCcli, 'CleanUpRes', cleanup)
+    generator = MUT.FxtVM.__wrapped__(Request(), mock.Mock(), mock.Mock())
+    next(generator)
+    primary = RuntimeError('synthetic primary')
+    if (teardown == 'close'): generator.close()
+    elif (teardown == 'resume'):
+        with pytest.raises(StopIteration): next(generator)
+    else:
+        with pytest.raises(RuntimeError) as caught: generator.throw(primary)
+        assert (caught.value is primary)
+
+    expected = records if (case == 'empty') else records[1:]
+    assert (cleanup.call_args_list == [mock.call([]), mock.call(expected)])
+    for (client, resRef, ownUID) in records:
+        client.Run.assert_called_once_with(
+            'get',
+            'VirtualMachines',
+            n=resRef.split('/', 1)[1], namespace=None,
+            o='jsonpath={.items[*].metadata.uid}',
+        )
+        client.DelRes.assert_not_called()
+
+
+@pytest.mark.parametrize('namespaceOpts', [
+    {'n': 'old-short'},
+    {'namespace': 'old-long'},
+    {'n': 'old-short', 'namespace': 'old-long'},
+])
+def test__RetainNS_OverridesAliasesWithoutChangingClient(
+    namespaceOpts: dict[str, str],
+) -> None:
+    options = namespaceOpts | {
+        'kubeconfig': '/selected/config', 'context': 'selected-context',
+    }
+    executor = mock.Mock()
+    executor.Run.side_effect = [
+        CommandResult(True, (
+            '  -n, --namespace=\n'
+            '      --kubeconfig=\n'
+            '      --context=\n'
+        )),
+        CommandResult(True),
+    ]
+    client = OCcli('oc-unit', cmdExec=executor, **options)
+
+    assert not MUT._RetainNS(client, 'Namespace/owned-ns')
+
+    assert (client.defOpts == options)
+    assert (executor.Run.call_count == 2)
+    command = executor.Run.call_args.args[0]
+    assert (command[0] == 'oc-unit')
+    assert (set(command[1:-3]) == {
+        '-n=owned-ns', '--kubeconfig=/selected/config',
+        '--context=selected-context',
+    })
+    assert (len(command[1:-3]) == 3)
+    assert (command[-3:] == [
+        'get', '-o=jsonpath={.items[*].metadata.uid}', 'VirtualMachines',
+    ])
+    assert (executor.Run.call_args.kwargs == {
+        'input': None, 'isSecret': False, 'tryMax': None, 'spPars': None,
+    })

@@ -39,7 +39,7 @@ class GoCobraCLI:
             Optional CmdExec instance (default: `new CmdExec()`).
         :param defOpts:
             Default values for common options, e.g.
-            `namespace='windows-bsod'`, `kubeconfig='/path/to/kcfg'`.
+            `namespace='windows-bsod'`, `kubeconfig='/path/to/kCfg'`.
         '''
         self.binExec = binExec
         self.cmdExec = cmdExec or CmdExec()
@@ -82,6 +82,7 @@ class GoCobraCLI:
         *args: Any,
         input: str | bytes | None = None,
         isSecret: bool = False,
+        tryMax: Optional[int] = None,
         spPars: Optional[dict[str, Any]] = None,
         **opts: Any,
     ) -> CmdRes:
@@ -99,9 +100,13 @@ class GoCobraCLI:
         :param isSecret:
             Framework log/record suppression only; never a CLI option.
             Raw results are unchanged and must not be logged by callers.
+        :param tryMax:
+            Optional max. no. of execution attempts passed through to
+            `CmdExec.Run()`.
         :param spPars:
             Optional `dict` of extra keyword arguments passed through
-            to `subprocess.run()` (e.g. `{'timeout': 30, 'env': myEnv}`).
+            to `subprocess.run()` (e.g. `{'timeout': 30, 'env': myEnv}`), via
+            `CmdExec.Run()`.
         :param opts:
             Keyword option's value:
             - `None`                 -> Flag omitted entirely (suppress option
@@ -158,5 +163,6 @@ class GoCobraCLI:
             [self.binExec, *cmnArgs, *subCmds, *subArgs, *posArgs],
             input=input,
             isSecret=isSecret,
+            tryMax=tryMax,
             spPars=spPars,
         )

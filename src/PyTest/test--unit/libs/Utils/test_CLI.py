@@ -118,6 +118,7 @@ def test_Run_BuildsCobraCommandAndOverridesDefaults() -> None:
         ],
         input='stdin',
         isSecret=False,
+        tryMax=None,
         spPars={'timeout': 2},
     )
 
@@ -137,7 +138,7 @@ def test_Run_SerializesDryRunAsSingleArgument() -> None:
             'oc', 'create', 'namespace', '--dry-run=client',
             '-o=yaml', '--save-config=true', 'vm-test',
         ],
-        input=None, spPars=None, isSecret=False,
+        input=None, isSecret=False, tryMax=None, spPars=None,
     )
 
 
@@ -163,9 +164,7 @@ def test_Run_RejectsInvalidOption() -> None:
 
 
 @pytest.mark.parametrize('isSecret', [False, True])
-def test_Run_SecretFlagIsExecutorMetadataNotCLIOption(
-    isSecret: bool,
-) -> None:
+def test_Run_SecretFlagIsExecutorMetadataNotCLIOption(isSecret: bool) -> None:
     executor = CommandExecutor(CmdRes(optionsText, '', 0, True))
     cli = MUT.GoCobraCLI('oc', cmdExec=executor, namespace='selected')
     executor.Run.reset_mock()
@@ -178,6 +177,25 @@ def test_Run_SecretFlagIsExecutorMetadataNotCLIOption(
     assert (result is expected)
     executor.Run.assert_called_once_with(
         ['oc', '--namespace=selected', 'create', 'secret'],
-        input='synthetic-payload', spPars={'timeout': 4},
-        isSecret=isSecret,
+        input='synthetic-payload', isSecret=isSecret, tryMax=None,
+        spPars={'timeout': 4},
+    )
+
+
+@pytest.mark.parametrize('tryMax', [None, 1, 3])
+def test_Run_ForwardsAttemptLimitAsExecutorMetadata(
+    tryMax: int | None,
+) -> None:
+    executor = CommandExecutor(CmdRes(optionsText, '', 0, True))
+    cli = MUT.GoCobraCLI('virtctl', cmdExec=executor)
+    executor.Run.reset_mock()
+    expected = CmdRes('out', 'err', 0, True)
+    executor.Run.return_value = expected
+
+    result = cli.Run('ssh', 'vm/guest', tryMax=tryMax, spPars={'timeout': 5})
+
+    assert (result is expected)
+    executor.Run.assert_called_once_with(
+        ['virtctl', 'ssh', 'vm/guest'], input=None, isSecret=False,
+        tryMax=tryMax, spPars={'timeout': 5},
     )

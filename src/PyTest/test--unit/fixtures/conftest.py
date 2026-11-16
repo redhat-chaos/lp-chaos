@@ -230,7 +230,18 @@ def LocalContext(
                 resource = state.secrets.get((ns, name))
             else:
                 resource = None
-            if ref.startswith(('Namespace/', 'Secret/')):
+            if (ref == 'VirtualMachines'):
+                assert ('jsonpath={.items[*].metadata.uid}' in command)
+                stdout = ' '.join(
+                    state.present[resource['metadata']['name']]
+                    for resource in state.resources
+                    if (
+                        (resource['kind'] == 'VirtualMachine') and
+                        (resource['metadata']['namespace'] == ns) and
+                        (resource['metadata']['name'] in state.present)
+                    )
+                )
+            elif ref.startswith(('Namespace/', 'Secret/')):
                 if resource:
                     stdout = (
                         resource['metadata']['uid']

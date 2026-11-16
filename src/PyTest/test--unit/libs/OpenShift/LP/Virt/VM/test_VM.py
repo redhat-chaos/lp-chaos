@@ -1,8 +1,10 @@
 from types import SimpleNamespace
+from typing import Optional
 from unittest import mock
 
 import pytest
 
+import libs.OpenShift.LP.Virt.VM.RHOVssh as sshModule
 from libs.OpenShift.LP.Virt.VM.RHOVssh import RHOVsshCon
 import libs.OpenShift.LP.Virt.VM.VM as MUT
 from libs.OpenShift.OCP.CLI.OC import OCcli
@@ -10,11 +12,40 @@ from libs.Utils.CmdExec import CmdRes
 import Utils
 
 
-def CommandResult(
-    success: bool,
-    stdout: str = '',
-    stderr: str = '',
-) -> CmdRes:
+@pytest.mark.parametrize('teardown', ['close', 'resume', 'primary'])
+@pytest.mark.parametrize('sshFailure', [False, True])
+def test_CleanUpVMs_RealHelpersOnGeneratorExit_ReviewRegression(
+    teardown: str,
+    sshFailure: bool,
+) -> None:
+    cli = OCmock()
+    cli.GetResUID.return_value = (True, 'owned-uid', '')
+    cli.DelRes.return_value = (OCcli.ResPhase.DELETED, CommandResult(False))
+    vm = SimpleNamespace(name='owned', RmvSSH=mock.Mock(
+        side_effect=RuntimeError('SSH failed') if sshFailure else None,
+    ))
+
+    def Fixture():
+        try: yield
+        finally:
+            MUT.VM.CleanUpVMs(
+                [vm], [(cli, 'VirtualMachine/owned', 'owned-uid')],
+            )
+
+    generator = Fixture()
+    next(generator)
+    error = RuntimeError('primary')
+    with pytest.raises(RuntimeError) as caught:
+        if (teardown == 'close'): generator.close()
+        elif (teardown == 'resume'): next(generator)
+        else: generator.throw(error)
+    if (teardown == 'primary'): assert (caught.value is error)
+    else: assert ('VM cleanup failed' in str(caught.value))
+    vm.RmvSSH.assert_called_once_with()
+    cli.DelRes.assert_called_once_with('VirtualMachine/owned')
+
+
+def CommandResult(success: bool, stdout: str = '', stderr: str = '') -> CmdRes:
     return CmdRes(stdout, stderr, 0 if success else 1, success)
 
 
@@ -103,15 +134,19 @@ def test_Init_CreatesDefaultClients(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (vm.cli.virtCtl is MUT.VirtCtlCLI.return_value)
 
 
+@pytest.mark.parametrize('stdout', [
+    'Running', "'Running'", " \t'Running'\n", '',
+])
 def test__Status_ReturnsValueOnlyForSuccess(
     virtualMachine: Utils.VMcontext,
+    stdout: str,
 ) -> None:
-    virtualMachine.oc.Run.return_value = CommandResult(True, "'Running'")
-    assert (virtualMachine.vm._Status() == 'Running')
+    virtualMachine.oc.Run.return_value = CommandResult(True, stdout)
+    assert (virtualMachine.vm._Status() == stdout)
     virtualMachine.oc.Run.assert_called_once_with(
         'get',
         'VirtualMachine/vm-one',
-        o="jsonpath='{.status.printableStatus}'",
+        o='jsonpath={.status.printableStatus}',
     )
 
     virtualMachine.oc.Run.return_value = CommandResult(False, "'Stopped'")
@@ -142,7 +177,9 @@ def test_Start_SkipsNativeStartButWaitsForActiveVM(
     assert (result is waitSuccess)
     virtualMachine.virtCtl.Run.assert_not_called()
     virtualMachine.oc.Run.assert_called_once_with(
-        'wait', 'VirtualMachine/vm-one', **{'for': 'condition=Ready'},
+        'wait',
+        'VirtualMachine/vm-one',
+        **{'for': 'condition=Ready'},
         timeout='5m' if (timeout is None) else timeout,
     )
 
@@ -178,7 +215,9 @@ def test_Start_WaitsOnlyAfterNativeStartSucceeds(
     if (not startSuccess): virtualMachine.oc.Run.assert_not_called()
     else:
         virtualMachine.oc.Run.assert_called_once_with(
-            'wait', 'VirtualMachine/vm-one', **{'for': 'condition=Ready'},
+            'wait',
+            'VirtualMachine/vm-one',
+            **{'for': 'condition=Ready'},
             timeout='5m' if (timeout is None) else timeout,
         )
 
@@ -208,8 +247,8 @@ def test_Start_SleepsRemainingProvisioningBudgetBeforeTransition(
     sequence.attach_mock(virtualMachine.oc.Run, 'oc')
 
     result = (
-        virtualMachine.vm.Start(provTO=7.0) if (timeout is None)
-        else virtualMachine.vm.Start(timeout=timeout, provTO=7.0)
+        virtualMachine.vm.Start(provTO=7) if (timeout is None)
+        else virtualMachine.vm.Start(timeout=timeout, provTO=7)
     )
 
     expected = [
@@ -232,18 +271,17 @@ def test_Start_SleepsRemainingProvisioningBudgetBeforeTransition(
     'provTO,queryLatency,sleeps,elapsed',
     [
         (None, 0.0, ([5.0] * 360), 1800.0),
-        (12.0, 0.0, [5.0, 5.0, 2.0], 12.0),
-        (12.0, 2.0, [5.0, 3.0], 14.0),
-        (12.0, 6.0, [5.0], 17.0),
-        (3.0, 4.0, [], 4.0),
-        (0.0, 0.0, [], 0.0),
+        (12, 0.0, [5.0, 5.0, 2.0], 12.0),
+        (12, 2.0, [5.0, 3.0], 14.0),
+        (12, 6.0, [5.0], 17.0),
+        (3, 4.0, [], 4.0),
     ],
 )
 def test_Start_ProvisioningTimeoutIncludesQueryLatencyWithoutNativeStart(
     monkeypatch: pytest.MonkeyPatch,
     virtualMachine: Utils.VMcontext,
     provisionClock: Utils.FakeClock,
-    provTO: float | None,
+    provTO: Optional[int],
     queryLatency: float,
     sleeps: list[float],
     elapsed: float,
@@ -291,7 +329,7 @@ def test_Start_UsesFinalQueryStatusBeforeProvisioningDeadlineCheck(
     virtualMachine.virtCtl.Run.return_value = CommandResult(True)
     virtualMachine.oc.Run.return_value = CommandResult(True)
 
-    assert (virtualMachine.vm.Start(timeout='2m', provTO=7.0) is True)
+    assert (virtualMachine.vm.Start(timeout='2m', provTO=7) is True)
 
     assert (provisionClock.now == 20.0)
     assert (MUT.VM._Status.call_count == 2)
@@ -369,7 +407,7 @@ def test_NewSSH_UsesDefaultsAndProbes(
     connection = MUT.RHOVsshCon.return_value
     connection.Probe.return_value = True
 
-    result = virtualMachine.vm.NewSSH(probeTO=12)
+    result = virtualMachine.vm.NewSSH(probeTO=42)
 
     assert (result is connection)
     MUT.RHOVsshCon.assert_called_once_with(
@@ -378,8 +416,9 @@ def test_NewSSH_UsesDefaultsAndProbes(
         user='qa-usr',
         idFile='~/.ssh/id_ed25519',
         virtCtl=virtualMachine.virtCtl,
+        oc=virtualMachine.oc,
     )
-    connection.Probe.assert_called_once_with(timeout=12)
+    connection.Probe.assert_called_once_with(42)
 
 
 def test_NewSSH_AllowsOverrides(
@@ -404,7 +443,80 @@ def test_NewSSH_AllowsOverrides(
         idFile='/override',
         ctrlPersist='1h',
         virtCtl=None,
+        oc=virtualMachine.oc,
     )
+
+
+@pytest.mark.parametrize(('overrideVirtCtl', 'overrideOC'), [
+    (False, False), (True, False), (False, True), (True, True),
+])
+def test_NewSSH_AppliesClientOverridesIndependently(
+    monkeypatch: pytest.MonkeyPatch,
+    virtualMachine: Utils.VMcontext,
+    overrideVirtCtl: bool,
+    overrideOC: bool,
+) -> None:
+    Utils.AutoPatch(monkeypatch, MUT, 'RHOVsshCon')
+    MUT.RHOVsshCon.return_value.Probe.return_value = True
+    overrides = {}
+    if overrideVirtCtl: overrides['virtCtl'] = None
+    if overrideOC: overrides['oc'] = None
+
+    virtualMachine.vm.NewSSH(**overrides)
+
+    kwargs = MUT.RHOVsshCon.call_args.kwargs
+    assert (kwargs['virtCtl'] is (
+        None if overrideVirtCtl else virtualMachine.virtCtl
+    ))
+    assert (kwargs['oc'] is (None if overrideOC else virtualMachine.oc))
+
+
+def test_NewSSH_PreservesExplicitOCAndVirtCtlPair(
+    monkeypatch: pytest.MonkeyPatch,
+    virtualMachine: Utils.VMcontext,
+) -> None:
+    Utils.AutoPatch(monkeypatch, MUT, 'RHOVsshCon')
+    MUT.RHOVsshCon.return_value.Probe.return_value = True
+    otherOC = mock.create_autospec(OCcli, instance=True)
+    otherVirtCtl = mock.MagicMock()
+
+    virtualMachine.vm.NewSSH(virtCtl=otherVirtCtl, oc=otherOC)
+
+    kwargs = MUT.RHOVsshCon.call_args.kwargs
+    assert (kwargs['oc'] is otherOC)
+    assert (kwargs['virtCtl'] is otherVirtCtl)
+    assert (virtualMachine.vm.cli.oc is virtualMachine.oc)
+    assert (virtualMachine.vm.cli.virtCtl is virtualMachine.virtCtl)
+
+
+def test_NewSSH_RecreatesBothClientsForExplicitKubeconfig(
+    monkeypatch: pytest.MonkeyPatch,
+    virtualMachine: Utils.VMcontext,
+) -> None:
+    Utils.AutoPatch(monkeypatch, RHOVsshCon, 'Probe')
+    RHOVsshCon.Probe.return_value = True
+    Utils.AutoPatch(monkeypatch, sshModule, 'OCcli')
+    Utils.AutoPatch(monkeypatch, sshModule, 'VirtCtlCLI')
+    sshModule.OCcli.return_value.GetResUID.return_value = (
+        True, 'selected-cluster', '',
+    )
+    executor = mock.MagicMock()
+
+    connection = virtualMachine.vm.NewSSH(
+        kubeconfig='/selected-config', virtCtl=None, oc=None, cmdExec=executor,
+    )
+
+    sshModule.OCcli.assert_called_once_with(
+        n='namespace', kubeconfig='/selected-config',
+    )
+    sshModule.VirtCtlCLI.assert_called_once_with(
+        n='namespace', kubeconfig='/selected-config',
+    )
+    assert (connection.cli.oc is sshModule.OCcli.return_value)
+    assert (connection.cli.virtCtl is sshModule.VirtCtlCLI.return_value)
+    assert (connection.cli.cmdExec is executor)
+    assert (connection.target == 'qa-usr@vm-one.namespace.selected-cluster')
+    virtualMachine.oc.GetResUID.assert_not_called()
 
 
 def test_NewSSH_TimeoutRaisesAndDoesNotCache(
@@ -415,10 +527,10 @@ def test_NewSSH_TimeoutRaisesAndDoesNotCache(
     connection = MUT.RHOVsshCon.return_value
     connection.Probe.return_value = False
 
-    with pytest.raises(TimeoutError, match='after 7 seconds'):
-        virtualMachine.vm.NewSSH(probeTO=7)
+    with pytest.raises(TimeoutError, match='after 37 seconds'):
+        virtualMachine.vm.NewSSH(probeTO=37)
 
-    connection.Probe.assert_called_once_with(timeout=7)
+    connection.Probe.assert_called_once_with(37)
     assert (virtualMachine.vm._ssh is None)
 
 
@@ -431,10 +543,10 @@ def test_ssh_UsesSelectedClientAndCachesConnection(
 
     connection = virtualMachine.vm.ssh
 
-    assert (connection.virtCtl is virtualMachine.virtCtl)
+    assert (connection.cli.virtCtl is virtualMachine.virtCtl)
     assert (connection.ns == virtualMachine.vm.namespace)
     assert (virtualMachine.vm.ssh is connection)
-    RHOVsshCon.Probe.assert_called_once_with(connection, timeout=300)
+    RHOVsshCon.Probe.assert_called_once_with(connection, 300)
 
 
 def test_NewSSH_PreservesExplicitClientOverride(
@@ -447,7 +559,13 @@ def test_NewSSH_PreservesExplicitClientOverride(
 
     connection = virtualMachine.vm.NewSSH(virtCtl=otherClient)
 
-    assert (connection.virtCtl is otherClient)
+    assert (connection.cli.virtCtl is otherClient)
+    assert (connection.cli.oc is virtualMachine.oc)
+    assert (connection.target.endswith('.cluster-one'))
+    virtualMachine.oc.GetResUID.assert_called_once_with(
+        'namespace/kube-system',
+    )
+    assert (virtualMachine.vm.cli.oc is virtualMachine.oc)
     assert (virtualMachine.vm.cli.virtCtl is virtualMachine.virtCtl)
 
 
@@ -501,3 +619,70 @@ def test_ssh_IsLazyAndCached(
     assert (virtualMachine.vm.ssh is connection)
     assert (virtualMachine.vm.ssh is connection)
     MUT.VM.NewSSH.assert_called_once_with(virtualMachine.vm)
+
+
+@pytest.mark.parametrize('probeTO', [1, 12, 24])
+def test_NewSSH_RejectsBudgetBelowDefaultProbeAllowance(
+    virtualMachine: Utils.VMcontext,
+    probeTO: int,
+) -> None:
+    with pytest.raises(ValueError, match='The `probeTO` must cover'):
+        virtualMachine.vm.NewSSH(probeTO=probeTO)
+
+    assert (virtualMachine.vm._ssh is None)
+    virtualMachine.virtCtl.Run.assert_not_called()
+
+
+@pytest.mark.parametrize('probeTO', [0.5, 1.5, '35', True, False])
+def test_NewSSH_RejectsNonIntegerProbeBudget(
+    virtualMachine: Utils.VMcontext,
+    probeTO: object,
+) -> None:
+    with pytest.raises(
+        ValueError, match='The `probeTO` must be a positive integer',
+    ):
+        virtualMachine.vm.NewSSH(probeTO=probeTO)
+
+    assert (virtualMachine.vm._ssh is None)
+    virtualMachine.virtCtl.Run.assert_not_called()
+
+
+@pytest.mark.parametrize('provTO', [
+    0, -1, 1.0, 0.5, True, False, None, '1', float('nan'), float('inf'),
+])
+def test_Start_RejectsInvalidProvisioningTimeoutBeforeCommands(
+    monkeypatch: pytest.MonkeyPatch,
+    virtualMachine: Utils.VMcontext,
+    provisionClock: Utils.FakeClock,
+    provTO: object,
+) -> None:
+    Utils.AutoPatch(monkeypatch, MUT.VM, '_Status')
+
+    with pytest.raises(
+        ValueError, match='^The `provTO` must be a positive integer',
+    ):
+        virtualMachine.vm.Start(provTO=provTO)
+
+    MUT.VM._Status.assert_not_called()
+    MUT.time.monotonic.assert_not_called()
+    MUT.time.sleep.assert_not_called()
+    virtualMachine.virtCtl.Run.assert_not_called()
+    virtualMachine.oc.Run.assert_not_called()
+
+
+@pytest.mark.parametrize('probeTO', [25, 34, 35])
+def test_NewSSH_AcceptsDefaultProbeCommandAllowance(
+    monkeypatch: pytest.MonkeyPatch,
+    virtualMachine: Utils.VMcontext,
+    probeTO: int,
+) -> None:
+    Utils.AutoPatch(monkeypatch, RHOVsshCon, 'Connect')
+    Utils.AutoPatch(monkeypatch, RHOVsshCon, 'Close')
+    Utils.AutoPatch(monkeypatch, sshModule.time, 'monotonic')
+    sshModule.time.monotonic.return_value = 10
+
+    connection = virtualMachine.vm.NewSSH(probeTO=probeTO)
+
+    RHOVsshCon.Connect.assert_called_once_with(connection, 5)
+    RHOVsshCon.Close.assert_called_once_with(connection, 5)
+    virtualMachine.virtCtl.Run.assert_not_called()
