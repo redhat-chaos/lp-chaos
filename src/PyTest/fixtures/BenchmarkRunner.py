@@ -54,7 +54,9 @@ _DEF__FXT_CFG = NamedDict(
             startVM=True,
             wlName='windows',
             wlKind='vm',
-            brEnv={},
+            brEnv={
+                'WORKLOAD_CONFIG': "{'storage': '96'}",
+            },
             timeout=NamedDict(
                 # One-time overhead (min.), mainly for external VM Image
                 #   Template import into an internal PVC.

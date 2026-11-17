@@ -11,6 +11,7 @@ from libs.Utils.CmdExec import CmdExec
 
 @pytest.fixture(autouse=True)
 def OfflineResources(monkeypatch: pytest.MonkeyPatch) -> None:
+    '''Block external command and socket calls in this test area.'''
     denied = mock.Mock(side_effect=AssertionError('External access forbidden'))
     monkeypatch.setattr(CmdExec, 'Run', denied)
     monkeypatch.setattr(subprocess, 'Popen', denied)
@@ -20,4 +21,5 @@ def OfflineResources(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(name='resourceCLI')
 def ResourceCLI() -> mock.MagicMock:
+    '''Provide an autospecced OC CLI mock for resource tests.'''
     return mock.create_autospec(OCcli, instance=True)

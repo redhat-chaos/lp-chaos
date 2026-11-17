@@ -226,10 +226,12 @@ def test_InitAndMerge_KeepModeAsDataAndShallowConstruction() -> None:
 @pytest.mark.parametrize('operator', ['deep', 'shallow'])
 @pytest.mark.parametrize(
     ('baseValue', 'overrideValue'),
-    [(None, 'resolved'), ('resolved', None), (None, None),
-     ([1, 1], [2, 1]),
-     (MUT.NamedDict(left=1), MUT.NamedDict(right=2)),
-     ({'left': 1}, {'right': 2})],
+    [
+        (None, 'resolved'), ('resolved', None), (None, None),
+        ([1, 1], [2, 1]),
+        (MUT.NamedDict(left=1), MUT.NamedDict(right=2)),
+        ({'left': 1}, {'right': 2}),
+    ],
 )
 def test_AugmentedOperators_RebindAndPreserveOperands(
     operator: str,
@@ -284,9 +286,11 @@ def test_AugmentedOperators_PreserveErrorsAndBinding(
 
 @pytest.mark.parametrize(
     ('baseValue', 'overrideValue'),
-    [(1, True), (1, 1.0), (MUT.NamedDict(number=1), {'number': 2}),
-     ([1], (2,)),
-     (MUT.NamedDict(number=1), MUT.NamedDict(number='bad'))],
+    [
+        (1, True), (1, 1.0), (MUT.NamedDict(number=1), {'number': 2}),
+        ([1], (2,)),
+        (MUT.NamedDict(number=1), MUT.NamedDict(number='bad')),
+    ],
 )
 def test_AugmentedOr_RejectsExactTypeConflictsWithoutMutation(
     baseValue: object,
@@ -449,8 +453,7 @@ def test_InitAndUpdate_RejectInvalidKeysBeforeMutation(
 ) -> None:
     value = MUT.NamedDict(preserved=0)
     source = (
-        pair for pair in
-        [('new', 1), ('___update___', 2), (invalidKey, 3)]
+        pair for pair in [('new', 1), ('___update___', 2), (invalidKey, 3)]
     )
 
     with pytest.raises(KeyError, match='valid python identifier'):
@@ -541,9 +544,7 @@ def test_CheckKeys_AcceptsMappingsIterablesAndKeywords() -> None:
 def test_OperatorAddAndOperatorReverseAdd_ShallowMergePreservesNamedDictType(
 ) -> None:
     base = MUT.NamedDict(
-        nested=MUT.NamedDict(left=1),
-        scalar=1,
-        preserved='default',
+        nested=MUT.NamedDict(left=1), scalar=1, preserved='default',
     )
 
     forward = base + {'right': 2}
@@ -552,10 +553,8 @@ def test_OperatorAddAndOperatorReverseAdd_ShallowMergePreservesNamedDictType(
     assert (type(forward) is MUT.NamedDict)
     assert (type(forward.nested) is MUT.NamedDict)
     assert (forward == {
-        'nested': MUT.NamedDict(left=1),
-        'scalar': 1,
-        'preserved': 'default',
-        'right': 2,
+        'nested': MUT.NamedDict(left=1), 'scalar': 1,
+        'preserved': 'default', 'right': 2,
     })
     assert (type(reflected) is MUT.NamedDict)
     assert (reflected == {'first': 0, **base})
@@ -565,24 +564,14 @@ def test_OperatorAddAndOperatorReverseAdd_ShallowMergePreservesNamedDictType(
 
 def test_OperatorOr_DeepMergePreservesExactTypesAndInputs() -> None:
     base = MUT.NamedDict(
-        nested=MUT.NamedDict(left=1),
-        scalar=1,
-        preserved='default',
+        nested=MUT.NamedDict(left=1), scalar=1, preserved='default',
     )
-    override = MUT.NamedDict(
-        nested=MUT.NamedDict(right=2),
-        scalar=2,
-        new=4,
-    )
+    override = MUT.NamedDict(nested=MUT.NamedDict(right=2), scalar=2, new=4)
     baseBefore = MUT.NamedDict(
-        nested=MUT.NamedDict(left=1),
-        scalar=1,
-        preserved='default',
+        nested=MUT.NamedDict(left=1), scalar=1, preserved='default',
     )
     overrideBefore = MUT.NamedDict(
-        nested=MUT.NamedDict(right=2),
-        scalar=2,
-        new=4,
+        nested=MUT.NamedDict(right=2), scalar=2, new=4,
     )
 
     merged = base | override
@@ -591,10 +580,8 @@ def test_OperatorOr_DeepMergePreservesExactTypesAndInputs() -> None:
     assert (type(merged.nested) is MUT.NamedDict)
     assert (type(merged.scalar) is int)
     assert (merged == {
-        'nested': MUT.NamedDict(left=1, right=2),
-        'scalar': 2,
-        'preserved': 'default',
-        'new': 4,
+        'nested': MUT.NamedDict(left=1, right=2), 'scalar': 2,
+        'preserved': 'default', 'new': 4,
     })
     assert (base == baseBefore)
     assert (override == overrideBefore)
@@ -613,9 +600,7 @@ def test__DeepMerge_PlainDictsPreserveExactTypesAndInputs() -> None:
     assert (type(merged) is dict)
     assert (type(merged['nested']) is dict)
     assert (merged == {
-        'nested': {'left': 1, 'right': 2},
-        'preserved': 'default',
-        'new': 4,
+        'nested': {'left': 1, 'right': 2}, 'preserved': 'default', 'new': 4,
     })
     assert (base == baseBefore)
     assert (override == overrideBefore)
@@ -645,9 +630,7 @@ def test_OperatorReverseOr_PlainOrNamedRetainsPlainNestedType() -> None:
     assert (type(reflected) is MUT.NamedDict)
     assert (type(reflected.nested) is dict)
     assert (reflected == {
-        'nested': {'left': 1, 'right': 2},
-        'preserved': 'default',
-        'new': 4,
+        'nested': {'left': 1, 'right': 2}, 'preserved': 'default', 'new': 4,
     })
 
 
@@ -667,10 +650,7 @@ def test_OperatorOrAndOperatorReverseOr_RejectsInvalidOperands() -> None:
 
 def test_OperatorOr_RejectPlainNestedConfigBeforeLosingDefaults() -> None:
     base = MUT.NamedDict(
-        cliCfg=MUT.NamedDict(
-            ocCfg={'default': True},
-            vcCfg={'default': True},
-        ),
+        cliCfg=MUT.NamedDict(ocCfg={'default': True}, vcCfg={'default': True}),
     )
     plainCliCfg = {'ocCfg': {'context': 'override'}}
 
@@ -703,17 +683,14 @@ def test__DeepMerge_RejectTypeMismatchWithFullPathAndUnchangedInputs(
     replace: bool,
 ) -> None:
     incoming = (
-        MUT.NamedDict._TypeReplace(overrideValue) if replace
-        else overrideValue
+        MUT.NamedDict._TypeReplace(overrideValue) if replace else overrideValue
     )
     base = MUT.NamedDict(outer={'non-identifier key': {7: baseValue}})
-    override = MUT.NamedDict(
-        outer={'non-identifier key': {7: incoming}},
-    )
+    override = MUT.NamedDict(outer={'non-identifier key': {7: incoming}})
     baseData = dict(baseValue) if isinstance(baseValue, dict) else baseValue
     overrideData = (
-        dict(overrideValue)
-        if isinstance(overrideValue, dict) else overrideValue
+        dict(overrideValue) if isinstance(overrideValue, dict)
+        else overrideValue
     )
     baseBefore = {'outer': {'non-identifier key': {7: deepcopy(baseData)}}}
     overrideBefore = {
@@ -726,8 +703,8 @@ def test__DeepMerge_RejectTypeMismatchWithFullPathAndUnchangedInputs(
         base | override
 
     expectedPrefix = (
-        'NamedDict replacement via `NamedDict._TypeReplace`'
-        if replace else 'NamedDict deep-merge'
+        'NamedDict replacement via `NamedDict._TypeReplace`' if replace
+        else 'NamedDict deep-merge'
     )
     assert (str(error.value) == (
         f"{expectedPrefix} at `['outer']['non-identifier key'][7]`: "
@@ -766,8 +743,7 @@ def test__DeepMerge_ErrorDoesNotExposeValuesOrOtherSettings() -> None:
         ('double"quote', "'double\"quote'"),
         ('back\\slash', r"'back\\slash'"),
         ('line\nbreak', r"'line\nbreak'"),
-        ('controls\r\t\0\x1b\b\f\v',
-         r"'controls\r\t\x00\x1b\x08\x0c\x0b'"),
+        ('controls\r\t\0\x1b\b\f\v', r"'controls\r\t\x00\x1b\x08\x0c\x0b'"),
         ('tick`key', "'tick`key'"),
         ('', "''"),
     ],
@@ -804,8 +780,7 @@ def test__DeepMerge_RecursesCopiesAndPreservesOrdinaryDataAndDefaults(
 ) -> None:
     base = mappingType(
         nested={'non-identifier key': {7: [1], 'keep': True}},
-        untouched=['default'],
-        optional=None,
+        untouched=['default'], optional=None,
     )
     newValue = MUT.NamedDict(new={'raw-key': []})
     extension = [2, 3]
@@ -848,9 +823,11 @@ def test__DeepMerge_RecursesCopiesAndPreservesOrdinaryDataAndDefaults(
 
 @pytest.mark.parametrize(
     ('baseValue', 'overrideValue'),
-    [(True, False), (1, 2), (1.0, 2.0), ('old', 'new'),
-     ((1,), (2,)), ({1}, {2}), (UserList([1]), UserList([2])),
-     (None, None)],
+    [
+        (True, False), (1, 2), (1.0, 2.0), ('old', 'new'),
+        ((1,), (2,)), ({1}, {2}), (UserList([1]), UserList([2])),
+        (None, None),
+    ],
 )
 def test__DeepMerge_ReplacesMatchingNonMappingsWithoutConversion(
     baseValue: object,
@@ -899,8 +876,10 @@ def test__DeepMerge_LateMismatchLeavesEarlierBranchesUnchanged() -> None:
 @pytest.mark.parametrize('mappingType', [dict, MUT.NamedDict])
 @pytest.mark.parametrize(
     ('baseItems', 'overrideItems', 'expected'),
-    [([], [], []), ([], [2], [2]), ([1], [], [1]),
-     ([1, 2], [2, 3], [1, 2, 2, 3])],
+    [
+        ([], [], []), ([], [2], [2]), ([1], [], [1]),
+        ([1, 2], [2, 3], [1, 2, 2, 3]),
+    ],
 )
 def test__DeepMerge_ConcatenatesNestedListsWithoutMutatingInputs(
     mappingType: type,
@@ -939,7 +918,7 @@ def test__DeepMerge_PreservesShallowListItemIdentityWithoutIndexMerge(
     merged = base | override
 
     assert (merged.items == (baseItems + overrideItems))
-    for (index, item) in enumerate(baseItems + overrideItems):
+    for (index, item) in enumerate((baseItems + overrideItems)):
         assert (merged.items[index] is item)
     assert (merged.items is not baseItems)
     assert (merged.items is not overrideItems)
@@ -1057,8 +1036,7 @@ def test_copy_NestedDefDictSeparatesOuterAndSharesChildren(
     populated: bool,
 ) -> None:
     nested = MUT.NestedDefDict()
-    if populated:
-        nested['child']['values'] = [1]
+    if populated: nested['child']['values'] = [1]
 
     copied = copyMethod(nested)
 
@@ -1080,8 +1058,7 @@ def test_deepcopy_NestedDefDictSeparatesOuterAndChildren(
     populated: bool,
 ) -> None:
     nested = MUT.NestedDefDict()
-    if populated:
-        nested['child']['values'] = [1]
+    if populated: nested['child']['values'] = [1]
 
     copied = deepcopy(nested)
 
@@ -1214,11 +1191,9 @@ def test__DeepMerge_ListReplacementDiffersFromOrdinaryConcatenation() -> None:
     override = MUT.NamedDict(
         items=added, nested=MUT.NamedDict(new=MUT.NamedDict._TypeReplace(3))
     )
-    assert (
-        (base | override) == {
-            'items': [1, 2], 'nested': {'keep': True, 'new': 3},
-        }
-    )
+    assert ((base | override) == {
+        'items': [1, 2], 'nested': {'keep': True, 'new': 3},
+    })
     assert (
         (base | MUT.NamedDict(items=MUT.NamedDict._TypeReplace(added))) == {
             'items': [2], 'nested': {'keep': True},
@@ -1235,13 +1210,10 @@ def test__DeepMerge_TypeReplacePreservesOpaqueCyclesAndAliasesWithoutRecursing(
 ) -> None:
     container = containerType()
     value = MUT.NamedDict._TypeReplace('opaque')
-    if (containerType is list):
-        container.extend([container, value])
-    else:
-        dict.update(container, cycle=container, value=value)
+    if (containerType is list): container.extend([container, value])
+    else: dict.update(container, cycle=container, value=value)
     base = MUT.NamedDict(retained=container)
-    if existing:
-        base.___update___(new=containerType())
+    if existing: base.___update___(new=containerType())
     marker = MUT.NamedDict._TypeReplace(container)
     override = MUT.NamedDict(new=marker)
     assert ((MUT.NamedDict() | MUT.NamedDict(new=container)).new is container)
@@ -1270,8 +1242,34 @@ def test_Call_SingletonMetaReusesFirstInstance() -> None:
         def __init__(self, value: int) -> None:
             self.value = value
 
-    first = Example(1)
-    second = Example(2)
+    instances = {}
+    with mock.patch.object(
+        MUT.SingletonMeta, '_SingletonMeta__instances', instances,
+    ):
+        first = Example(1)
+        second = Example(2)
 
-    assert (first is second)
-    assert (second.value == 1)
+        assert (first is second)
+        assert (second.value == 1)
+        assert (instances == {Example: first})
+
+
+def test_TempEnv_RestoresEnvironmentAndPropagatesExceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = {'changed': 'before', 'unchanged': 'same', 'removed': 'restore'}
+    environ = original.copy()
+    monkeypatch.setattr(MUT, 'os', mock.Mock(environ=environ))
+    tempEnv = MUT.TempEnv()
+
+    with pytest.raises(RuntimeError, match='sentinel'):
+        with tempEnv as entered:
+            assert (entered is tempEnv)
+            assert (tempEnv.origEnv == original)
+            assert (tempEnv.origEnv is not environ)
+            environ['changed'] = 'after'
+            environ['added'] = 'new'
+            del environ['removed']
+            raise RuntimeError('sentinel')
+
+    assert (environ == original)

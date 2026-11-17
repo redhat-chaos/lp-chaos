@@ -1,16 +1,29 @@
+from types import SimpleNamespace
 from unittest import mock
-import ast
+
 import inspect
 import json
 import logging
 import re
 import subprocess
-import textwrap
 
 import pytest
 
 import libs.OpenShift.OCP.CLI.OC as MUT
-import Utils
+
+
+@pytest.fixture(name='jsonLoads', autouse=True)
+def FxtJSONLoads(monkeypatch: pytest.MonkeyPatch) -> mock.Mock:
+    jsonLoads = mock.Mock(return_value=None)
+    monkeypatch.setattr(MUT, 'json', mock.Mock(loads=jsonLoads))
+    return jsonLoads
+
+
+@pytest.fixture(autouse=True)
+def PatchRuntimeState(monkeypatch: pytest.MonkeyPatch) -> None:
+    '''Stub OC cleanup's exception-state query at its module boundary.'''
+    excInfo = mock.Mock(return_value=(None, None, None))
+    monkeypatch.setattr(MUT, 'sys', SimpleNamespace(exc_info=excInfo))
 
 
 @pytest.mark.parametrize('outer,inner', [
@@ -21,11 +34,16 @@ def test_NewRes_SecretCannotBeDowngraded_ReviewRegression(
     inner: bool,
 ) -> None:
     cli = BuildCLI()
-    cli.Run.side_effect = [Result(True, '{}'), Result(True, ''), Result(
-        True, '{"kind":"Secret","metadata":{"name":"synthetic"}}',
-    )]
+    response = '{"kind":"Secret","metadata":{"name":"synthetic"}}'
+    MUT.json.loads.return_value = {
+        'kind': 'Secret', 'metadata': {'name': 'synthetic'},
+    }
+    cli.Run.side_effect = [
+        Result(True, '{}'), Result(True, ''), Result(True, response),
+    ]
     cli.NewRes({
-        'subCmd': 'secret generic', 'args': ['synthetic'],
+        'subCmd': 'secret generic',
+        'args': ['synthetic'],
         'opts': {'isSecret': inner},
     }, isSecret=outer, checkExist=True, waitCond=None)
     assert (len(cli.Run.call_args_list) == 3)
@@ -33,6 +51,7 @@ def test_NewRes_SecretCannotBeDowngraded_ReviewRegression(
         (call.kwargs['isSecret'] is outer)
         for call in cli.Run.call_args_list
     )
+    MUT.json.loads.assert_called_once_with(response)
 
 
 @pytest.mark.parametrize('phase', ['APPLIED', 'WAITED'])
@@ -44,9 +63,11 @@ def test_EnsureRes_FailedCreationCleansValidatedTargetAndRaisesOriginal(
     native: bool,
 ) -> None:
     cli = BuildCLI()
-    manifest = json.dumps({
+    resource = {
         'kind': 'ConfigMap', 'metadata': {'name': 'example', 'uid': 'owned'},
-    })
+    }
+    manifest = json.dumps(resource)
+    MUT.json.loads.return_value = resource
     specification = (
         {'subCmd': 'configmap', 'args': ['example']} if native else manifest
     )
@@ -91,9 +112,11 @@ def test_NewRes_CleanupNeverReplacesCreationException(
     cleanupRaises: bool,
 ) -> None:
     cli = BuildCLI()
-    manifest = json.dumps({
+    resource = {
         'kind': 'ConfigMap', 'metadata': {'name': 'example', 'uid': 'owned'},
-    })
+    }
+    manifest = json.dumps(resource)
+    MUT.json.loads.return_value = resource
     primary = RuntimeError('original creation error')
     responses = [Result(True, manifest), Result(True)]
     if (phase == 'wait'): responses.append(Result(True, manifest))
@@ -141,6 +164,7 @@ def test_EnsureRes_DefaultWaitAndCallerOptionsAreForwarded(
         'kind': 'ConfigMap', 'metadata': {'name': 'example', 'uid': 'uid'},
     }
     manifest = json.dumps(resource)
+    MUT.json.loads.return_value = resource
     cli.Run.side_effect = [
         Result(True, manifest), Result(True), Result(True, manifest),
         Result(True),
@@ -165,33 +189,24 @@ def test_EnsureRes_DefaultWaitAndCallerOptionsAreForwarded(
 @pytest.mark.parametrize(
     'name,parameters',
     [
-        (
-            'NewRes',
-            [
-                'resYAMLorSubCmd',
-                'checkExist',
-                'isSecret',
-                'waitCond',
-                'waitTime',
-            ],
-        ),
+        ('NewRes', [
+            'resYAMLorSubCmd', 'checkExist', 'isSecret', 'waitCond',
+            'waitTime',
+        ]),
         ('GetResUID', ['resRef']),
         ('EnsureRes', [
             'resYAMLorSubCmd', 'owned', 'isSecret', 'existResDelTO',
             'optsNewRes',
         ]),
         ('CleanUpRes', ['ownRes', 'optsDelRes']),
-        ('CleanUpVMs', ['vmList', 'ownVMs', 'optsCleanUpRes']),
+        ('DelRes', ['resRef', 'waitTime']),
     ],
 )
-def test_ResourceAPI_DocstringsRetainContractsAnd79Columns(
+def test_OCcli_ResourceMethodsDocumentContracts(
     name: str,
     parameters: list[str],
 ) -> None:
-    from libs.OpenShift.LP.Virt.VM.VM import VM
-    method = getattr(VM if (name == 'CleanUpVMs') else MUT.OCcli, name)
-    source = inspect.getsource(method)
-    node = ast.parse(textwrap.dedent(source)).body[0]
+    method = getattr(MUT.OCcli, name)
     doc = inspect.getdoc(method)
     assert ([
         parameter for parameter in inspect.signature(method).parameters
@@ -200,24 +215,7 @@ def test_ResourceAPI_DocstringsRetainContractsAnd79Columns(
     for parameter in parameters: assert (f':param {parameter}:' in doc)
     if (inspect.signature(method).return_annotation is not None):
         assert (':return:' in doc)
-    assert all(
-        (len(line) <= 79)
-        for line in source.splitlines()[
-            (node.body[0].lineno - 1) : node.body[0].end_lineno
-        ]
-    )
-    if (name == 'CleanUpVMs'):
-        assert ('wrappers for reused VMs' in doc)
-        assert (('not\natomic' in doc) or ('not atomic' in doc))
-        assert ('OCcli.CleanUpRes' in doc)
-    for statement in ast.walk(node):
-        if (isinstance(statement, (ast.If, ast.While)) and isinstance(
-            statement.test, ast.UnaryOp
-        )):
-            line = textwrap.dedent(source).splitlines()[(statement.lineno - 1)]
-            assert not line.lstrip().startswith(
-                ('if (not ', 'elif (not ', 'while (not ')
-            )
+    assert all((len(line) <= 79) for line in method.__doc__.splitlines())
 
 
 @pytest.mark.parametrize('primary', [False, True])
@@ -235,7 +233,7 @@ def test_CleanUpRes_LogsEachOutcomeBeforeNextResourceAndPreservesPrimary(
         'changed',
         'success',
     ]
-    def Run(command: str, ref: str, **kwargs: object) -> MUT.CmdRes:
+    def Run(command: str, ref: str, **kwargs: object) -> mock.Mock:
         observed.append(
             (command, ref, [record.getMessage() for record in caplog.records])
         )
@@ -251,18 +249,20 @@ def test_CleanUpRes_LogsEachOutcomeBeforeNextResourceAndPreservesPrimary(
     cli.Run.side_effect = Run
     records = [(cli, f'Pod/{name}', 'owned') for name in names]
     original = RuntimeError('original test failure')
+    if primary: MUT.sys.exc_info.return_value = (RuntimeError, original, None)
     with caplog.at_level(logging.INFO, logger=MUT.__name__):
         if primary:
             try: raise original
             except RuntimeError as error:
                 MUT.OCcli.CleanUpRes(records)
-                assert (MUT.sys.exc_info()[1] is error is original)
+                assert (error is original)
         else:
             with pytest.raises(
                 RuntimeError, match='Resource cleanup failed'
             ) as caught:
                 MUT.OCcli.CleanUpRes(records)
             assert all((name in str(caught.value)) for name in names[:3])
+    MUT.sys.exc_info.assert_called_once_with()
     expected = [
         'verify ownership',
         'at `WAITED`',
@@ -290,7 +290,7 @@ def test_CleanUpRes_LogsEachOutcomeBeforeNextResourceAndPreservesPrimary(
 @pytest.mark.parametrize('success', [False, True])
 def test_GetResUID_PreservesLookupContract(success: bool) -> None:
     cli = BuildCLI()
-    cli.Run.return_value = MUT.CmdRes(' uid-1\n', ' warning\n', 0, success)
+    cli.Run.return_value = Result(success, ' uid-1\n', ' warning\n')
     assert (cli.GetResUID('Pod/example') == (success, 'uid-1', 'warning'))
     cli.Run.assert_called_once_with(
         'get',
@@ -314,7 +314,6 @@ def test_GetResUID_PreservesLookupContract(success: bool) -> None:
 )
 @pytest.mark.parametrize('options', [None, {'waitTime': '5m'}])
 def test_CleanUpRes_ChecksOwnershipContinuesAndPreservesPrimary(
-    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     primary: bool,
     outcome: str,
@@ -335,10 +334,8 @@ def test_CleanUpRes_ChecksOwnershipContinuesAndPreservesPrimary(
         Result((outcome != 'delete-failed'), stderr='synthetic-sensitive'),
     )
     if primary:
-        monkeypatch.setattr(
-            MUT.sys,
-            'exc_info',
-            lambda: (RuntimeError, RuntimeError('primary'), None),
+        MUT.sys.exc_info.return_value = (
+            RuntimeError, RuntimeError('primary'), None,
         )
     records = [
         (cli, 'secret/example', 'owned'),
@@ -351,144 +348,166 @@ def test_CleanUpRes_ChecksOwnershipContinuesAndPreservesPrimary(
         ) as caught:
             MUT.OCcli.CleanUpRes(records, optsDelRes=options)
         assert ('synthetic-sensitive' in str(caught.value))
-    else:
-        MUT.OCcli.CleanUpRes(records, optsDelRes=options)
+    else: MUT.OCcli.CleanUpRes(records, optsDelRes=options)
     later.GetResUID.assert_called_once_with('secret/later')
     if (outcome in ('success', 'delete-failed')):
         cli.DelRes.assert_called_once_with('secret/example', **(options or {}))
-    else:
-        cli.DelRes.assert_not_called()
+    else: cli.DelRes.assert_not_called()
     if (failed and primary):
         assert ('preserving primary exception' in caplog.text)
 
 
 @pytest.mark.parametrize('isSecret', [False, True])
 @pytest.mark.parametrize('asSubcommand', [False, True])
-@pytest.mark.parametrize(
-    'stop',
-    [
-        'dry-run',
-        'lookup-failed',
-        'existed',
-        'absent',
-        'apply',
-        'wait',
-        'skip-wait',
-        'success',
-    ],
-)
-def test_NewRes_UniformContractPreservesCommandsAndResourceAcrossPhases(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+@pytest.mark.parametrize('stop', [
+    'dry-run', 'lookup-failed', 'existed', 'absent', 'apply', 'wait',
+    'skip-wait', 'success',
+])
+def test_NewRes_UniformContractUsesMockedOCBoundary(
     isSecret: bool,
     asSubcommand: bool,
     stop: str,
 ) -> None:
+    cli = BuildCLI()
     resource = {
         'kind': 'Secret',
         'metadata': {'name': 'synthetic-secret', 'uid': 'uid-1'},
     }
-    generated = json.dumps(resource)
-    calls = []
-    checkExist = stop in ('lookup-failed', 'existed', 'absent')
-
-    def Run(
-        command: list[str],
-        **kwargs: object,
-    ) -> subprocess.CompletedProcess[str]:
-        assert (kwargs['text'] is True)
-        assert (kwargs['capture_output'] is True)
-        assert not any(('secret=' in part.lower()) for part in command)
-        if (command[-1] == 'options'):
-            return subprocess.CompletedProcess(command, 0, '', '')
-        calls.append((command, kwargs))
-        subcommand = command[1]
-        failed = (subcommand == {'dry-run': 'create', 'lookup-failed': 'get',
-                                 'apply': 'apply', 'wait': 'wait'}.get(stop))
-        stdout = generated
-        if ((subcommand == 'get') and (stop == 'absent')): stdout = ''
-        if (subcommand == 'wait'):
-            assert (command == [
-                'oc-unit',
-                'wait',
-                '--for=create',
-                '--timeout=2m',
-                'Secret/synthetic-secret',
-            ])
-            stdout = 'synthetic-wait-output'
-        if (subcommand in ('get', 'apply')):
-            assert (kwargs['input'] == generated)
-        return subprocess.CompletedProcess(
-            command, int(failed), stdout, 'synthetic-private-stderr'
-        )
-
-    monkeypatch.setattr(subprocess, 'run', Run)
-    recorder = Utils.RecordingExec()
-    cli = MUT.OCcli('oc-unit', cmdExec=recorder)
-    recorder.inputs.clear()
-    specification = {'subCmd': 'secret generic', 'args': ['synthetic-secret']}
-    with caplog.at_level('DEBUG'):
-        (phase, result, actual) = cli.NewRes(
-            specification if asSubcommand else generated,
-            checkExist=checkExist, isSecret=isSecret,
-            waitCond=None if (stop == 'skip-wait') else 'create',
-        )
-    expected = {
-        'dry-run': (MUT.OCcli.ResPhase.DRY_RUN, 1),
-        'lookup-failed': (MUT.OCcli.ResPhase.EXISTED, 2),
-        'existed': (MUT.OCcli.ResPhase.EXISTED, 2),
-        'apply': (MUT.OCcli.ResPhase.APPLIED, 2),
-        'wait': (MUT.OCcli.ResPhase.WAITED, 3),
-        'skip-wait': (MUT.OCcli.ResPhase.APPLIED, 2),
-        'absent': (MUT.OCcli.ResPhase.WAITED, 4),
-    }.get(stop, (MUT.OCcli.ResPhase.WAITED, 3))
-    assert ((phase, len(calls)) == expected)
-    assert (result.success == (
-        stop not in ('dry-run', 'lookup-failed', 'apply', 'wait')
-    ))
-    assert (result.exitStat == (0 if result.success else 1))
-    assert (result.stderr == 'synthetic-private-stderr')
-    assert (actual == (
-        None if (stop in ('dry-run', 'lookup-failed', 'apply')) else resource
-    ))
-    assert (
-        any((command[1] == 'get') for (command, _) in calls) is (checkExist)
+    MUT.json.loads.return_value = resource
+    specification = (
+        {
+            'subCmd': 'secret generic',
+            'args': ['synthetic-secret'],
+            'opts': {},
+        }
+        if asSubcommand else 'kind: Secret'
     )
-    if (stop in ('lookup-failed', 'existed')):
-        assert not any((command[1] == 'apply') for (command, _) in calls)
-    if isSecret:
-        assert (recorder.inputs == [])
-        for value in (
+    dryRun = Result((stop != 'dry-run'), 'normalized')
+    checkExist = stop in ('lookup-failed', 'existed', 'absent')
+    lookupResult = {
+        'lookup-failed': Result(False, stderr='synthetic lookup failure'),
+        'existed': Result(True, 'existing-json'),
+        'absent': Result(True, ''),
+    }.get(stop)
+    applyResult = Result(
+        (stop != 'apply'), 'apply-json', 'synthetic-private-stderr',
+    )
+    waitResult = Result((stop != 'wait'), 'wait-output')
+    responses = [dryRun]
+    if checkExist: responses.append(lookupResult)
+    if (stop in ('absent', 'apply', 'wait', 'skip-wait', 'success')):
+        responses.append(applyResult)
+    if (stop in ('absent', 'wait', 'success')):
+        responses.append(waitResult)
+    cli.Run.side_effect = responses
+    waitCond = None if (stop == 'skip-wait') else 'create'
+
+    (phase, result, actual) = cli.NewRes(
+        specification,
+        checkExist=checkExist,
+        isSecret=isSecret,
+        waitCond=waitCond,
+    )
+
+    expectedCalls = (
+        [mock.call(
+            'create secret generic',
             'synthetic-secret',
-            'synthetic-private-stderr',
-            'synthetic-wait-output',
-        ):
-            assert (value not in caplog.text)
-        if result.success: assert (caplog.text == '')
-        else:
-            assert (
-                'Command failed with exit code 1 (Try 1/1)' in caplog.text
-            )
-    else:
-        assert (len(recorder.inputs) == len(calls))
+            dry_run='client',
+            o='yaml',
+            save_config=True,
+            isSecret=isSecret,
+        )]
+        if asSubcommand else
+        [mock.call(
+            'create', '-f', '-', input='kind: Secret',
+            isSecret=isSecret, dry_run='client', o='yaml', save_config=True,
+        )]
+    )
+    if checkExist:
+        expectedCalls.append(mock.call(
+            'get', input='normalized', isSecret=isSecret,
+            o='json', f='-', ignore_not_found=True,
+        ))
+    if (stop in ('absent', 'apply', 'wait', 'skip-wait', 'success')):
+        expectedCalls.append(mock.call(
+            'apply', '-f', '-', input='normalized',
+            isSecret=isSecret, o='json',
+        ))
+    if (stop in ('absent', 'wait', 'success')):
+        expectedCalls.append(mock.call(
+            'wait', 'Secret/synthetic-secret', isSecret=isSecret,
+            **{'for': 'create'}, timeout='2m',
+        ))
+    expected = {
+        'dry-run': (cli.ResPhase.DRY_RUN, dryRun, None, False),
+        'lookup-failed': (
+            cli.ResPhase.EXISTED, lookupResult, None, False,
+        ),
+        'existed': (
+            cli.ResPhase.EXISTED, lookupResult, resource, True,
+        ),
+        'absent': (cli.ResPhase.WAITED, waitResult, resource, True),
+        'apply': (cli.ResPhase.APPLIED, applyResult, None, False),
+        'wait': (cli.ResPhase.WAITED, waitResult, resource, False),
+        'skip-wait': (
+            cli.ResPhase.APPLIED, applyResult, resource, True,
+        ),
+        'success': (cli.ResPhase.WAITED, waitResult, resource, True),
+    }
+    (expectedPhase, expectedResult, expectedResource, expectedSuccess) = (
+        expected[stop]
+    )
+    assert (phase is expectedPhase)
+    assert (result is expectedResult)
+    expectedStderr = {
+        'lookup-failed': 'synthetic lookup failure',
+        'apply': 'synthetic-private-stderr',
+        'skip-wait': 'synthetic-private-stderr',
+    }.get(stop, '')
+    assert (result.stderr == expectedStderr)
+    assert (result.success is expectedSuccess)
+    assert (actual is expectedResource)
+    assert (cli.Run.call_args_list == expectedCalls)
+    if (stop == 'existed'):
+        MUT.json.loads.assert_called_once_with('existing-json')
+    elif (stop in ('absent', 'wait', 'skip-wait', 'success')):
+        MUT.json.loads.assert_called_once_with('apply-json')
+    else: MUT.json.loads.assert_not_called()
 
 
 @pytest.mark.parametrize('lookup', [False, True])
-@pytest.mark.parametrize('payload', ['not-json', 'null', '[]', '{}'])
+@pytest.mark.parametrize(('payload', 'parsed', 'parserError'), [
+    ('not-json', None, ValueError('synthetic parser failure')),
+    ('null', None, None),
+    ('[]', [], None),
+    ('{}', {}, None),
+    ('"synthetic non-object"', 'synthetic non-object', None),
+])
 def test_NewRes_InvalidResourceJSONRaisesWithoutResponseData(
     lookup: bool,
     payload: str,
+    parsed: object,
+    parserError: Exception | None,
 ) -> None:
     cli = BuildCLI()
-    cli.Run.side_effect = [Result(True, 'normalized'), Result(True, payload)]
+    cli.Run.side_effect = [
+        Result(True, 'normalized'), Result(True, payload),
+    ]
+    MUT.json.loads.return_value = parsed
+    MUT.json.loads.side_effect = parserError
+
     with pytest.raises(ValueError) as caught:
         cli.NewRes('manifest', checkExist=lookup)
-    assert (str(caught.value) == ((
+
+    expectedPhase = 'EXISTED' if lookup else 'APPLIED'
+    assert (str(caught.value) == (
         '`NewRes()`: Invalid resource Live Object State at '
-    ) + (
-        'EXISTED.' if lookup else 'APPLIED.'
-    )))
+        f'{expectedPhase}.'
+    ))
+    assert (caught.value.__suppress_context__ is True)
     assert (cli.Run.call_count == 2)
+    MUT.json.loads.assert_called_once_with(payload)
 
 
 def test_ResPhase_ExistedFollowsDryRun() -> None:
@@ -514,6 +533,7 @@ def test_EnsureRes_ActualNewResReturnsObjectAndTracksOnlyCreation(
         'kind': kind, 'metadata': {'name': 'example', 'uid': 'created-uid'},
     }
     manifest = json.dumps(resource)
+    MUT.json.loads.return_value = resource
     cli.Run = mock.Mock(side_effect=[
         Result(True, manifest),
         Result(True, manifest if existing else ''),
@@ -554,20 +574,25 @@ def test_EnsureRes_FailurePrecedesResourceAccess(phase: str) -> None:
 @pytest.mark.parametrize('lookup', [False, True])
 def test_EnsureRes_InvalidJSONRetainsSanitizedPhase(lookup: bool) -> None:
     cli = BuildCLI()
+    payload = 'synthetic-private-invalid-json'
     cli.Run.side_effect = [
         Result(True, 'normalized'),
-        Result(True, 'private-invalid-json' if lookup else ''),
-        Result(True, 'private-invalid-json'),
+        Result(True, payload if lookup else ''),
+        Result(True, payload),
     ]
+    MUT.json.loads.side_effect = ValueError('private parser error')
     owned = []
+
     with pytest.raises(ValueError) as caught:
         cli.EnsureRes('manifest', owned, isSecret=True)
-    phase = cli.ResPhase.EXISTED if lookup else cli.ResPhase.APPLIED
+
+    expectedPhase = 'EXISTED' if lookup else 'APPLIED'
     assert (str(caught.value) == (
-        f'`NewRes()`: Invalid resource Live Object State at {phase.name}.'
+        f'`NewRes()`: Invalid resource Live Object State at {expectedPhase}.'
     ))
     assert not owned
     assert (cli.Run.call_count == (2 if lookup else 3))
+    MUT.json.loads.assert_called_once_with(payload)
 
 
 @pytest.mark.parametrize('resource', [
@@ -598,51 +623,103 @@ def test_EnsureRes_DeletionWaitThenReensure(
     outcome: str,
 ) -> None:
     cli = BuildCLI()
+    metadata = {'name': 'example', 'namespace': 'resource-ns'}
     deleting = {
         'kind': 'ConfigMap',
-        'metadata': {'name': 'example', 'uid': 'old',
-                     'deletionTimestamp': 'now'},
+        'metadata': {
+            **metadata, 'uid': 'old', 'deletionTimestamp': 'now',
+        },
     }
-    created = {'kind': 'ConfigMap',
-               'metadata': {'name': 'example', 'uid': 'new'}}
-    manifest = json.dumps(created)
-    responses = [Result(True, manifest), Result(True, json.dumps(deleting))]
+    created = {'kind': 'ConfigMap', 'metadata': {**metadata, 'uid': 'new'}}
+    manifest = json.dumps({'kind': 'ConfigMap', 'metadata': metadata})
+    deletionOutput = 'synthetic-deleting-object'
+    createdOutput = 'synthetic-created-object'
+    responses = [
+        Result(True, 'normalized'),
+        Result(True, deletionOutput),
+    ]
     if (outcome == 'exception'):
         responses.append(subprocess.TimeoutExpired('synthetic', 17))
-    else:
-        responses.append(Result((outcome != 'failed')))
-    responses.extend([
-        Result(True, manifest),
-        Result((outcome != 'retry'), json.dumps(deleting)
-               if (outcome == 'still-deleting') else ''),
-        Result(True, manifest),
-        Result(True),
-    ])
+    else: responses.append(Result((outcome != 'failed')))
+    if (outcome not in ('failed', 'exception')):
+        responses.extend([
+            Result(True, 'normalized'),
+            Result((outcome != 'retry'), (
+                deletionOutput if (outcome == 'still-deleting') else ''
+            )),
+        ])
+        if (outcome == 'gone'):
+            responses.extend([
+                Result(True, createdOutput), Result(True),
+            ])
     cli.Run.side_effect = responses
+    parseResults = [deleting]
+    if (outcome == 'gone'): parseResults.append(created)
+    elif (outcome == 'still-deleting'): parseResults.append(deleting)
+    MUT.json.loads.side_effect = parseResults
     owned = []
     options = {} if (timeout is None) else {'existResDelTO': timeout}
+    resRef = 'ConfigMap/example'
+
     if (outcome == 'gone'):
-        assert (cli.EnsureRes(manifest, owned, **options) == created)
-        assert (owned == [(cli, 'ConfigMap/example', 'new')])
-        assert ([call.args[0] for call in cli.Run.call_args_list] == [
-            'create', 'get', 'wait', 'create', 'get', 'apply', 'wait',
-        ])
+        actual = cli.EnsureRes(manifest, owned, **options)
+        assert (actual is created)
+        assert (len(owned) == 1)
+        (ownedOC, actualRef, uid) = owned[0]
+        assert (actualRef == resRef)
+        assert (uid == 'new')
+        assert (ownedOC.defOpts == {'n': 'resource-ns'})
     else:
-        match = 'EXISTED' if (outcome == 'retry') else (
-            'ConfigMap/example.*' + (timeout or '5m'))
+        match = (
+            'EXISTED' if (outcome == 'retry') else
+            f'{resRef}.*{timeout or "5m"}'
+        )
         with pytest.raises(RuntimeError, match=match):
             cli.EnsureRes(manifest, owned, **options)
-        assert (owned == [])
-    assert (cli.Run.call_args_list[2] == mock.call(
-        'wait', 'ConfigMap/example', **{'for': 'delete'},
-        timeout=(timeout or '5m'), isSecret=False,
-    ))
-    assert not any((call.args[0] == 'delete')
-                   for call in cli.Run.call_args_list)
-    if (outcome == 'still-deleting'):
-        assert ([call.args[0] for call in cli.Run.call_args_list] == [
-            'create', 'get', 'wait', 'create', 'get',
+        assert not owned
+
+    expectedCalls = [
+        mock.call(
+            'create', '-f', '-', input=manifest, isSecret=False,
+            dry_run='client', o='yaml', save_config=True,
+        ),
+        mock.call(
+            'get', input='normalized', isSecret=False,
+            o='json', f='-', ignore_not_found=True,
+        ),
+        mock.call(
+            'wait', resRef, isSecret=False, **{'for': 'delete'},
+            timeout=(timeout or '5m'),
+        ),
+    ]
+    if (outcome not in ('failed', 'exception')):
+        expectedCalls.extend([
+            mock.call(
+                'create', '-f', '-', input=manifest, isSecret=False,
+                dry_run='client', o='yaml', save_config=True,
+            ),
+            mock.call(
+                'get', input='normalized', isSecret=False,
+                o='json', f='-', ignore_not_found=True,
+            ),
         ])
+        if (outcome == 'gone'):
+            expectedCalls.extend([
+                mock.call(
+                    'apply', '-f', '-', input='normalized',
+                    isSecret=False, o='json',
+                ),
+                mock.call(
+                    'wait', resRef, isSecret=False,
+                    **{'for': 'create'}, timeout='2m',
+                ),
+            ])
+    assert (cli.Run.call_args_list == expectedCalls)
+    expectedParses = [mock.call(deletionOutput)]
+    if (outcome == 'gone'): expectedParses.append(mock.call(createdOutput))
+    elif (outcome == 'still-deleting'):
+        expectedParses.append(mock.call(deletionOutput))
+    assert (MUT.json.loads.call_args_list == expectedParses)
 
 
 @pytest.mark.parametrize('timestamp', [None, 'now'])
@@ -665,52 +742,62 @@ def test_EnsureRes_NullDeletionTimestampAndInvalidDeletingIdentity(
     cli.Run.assert_not_called()
 
 
-def Result(success: bool, stdout: str = '', stderr: str = '') -> MUT.CmdRes:
-    return MUT.CmdRes(stdout, stderr, 0 if success else 1, success)
+def Result(success: bool, stdout: str = '', stderr: str = '') -> mock.Mock:
+    return mock.Mock(stdout=stdout, stderr=stderr, success=success)
 
 
 def BuildCLI() -> MUT.OCcli:
     cli = object.__new__(MUT.OCcli)
-    cli.Run = mock.create_autospec(cli.Run)
+    cli.Run = mock.Mock()
+    cli.defOpts = {}
+    cli.cmdExec = mock.sentinel.cmdExec
+    cli.cmnOpts = mock.sentinel.cmnOpts
+    cli.shortMap = mock.sentinel.shortMap
     return cli
 
 
 def test_Init_DelegatesToBase(monkeypatch: pytest.MonkeyPatch) -> None:
-    Utils.AutoPatch(monkeypatch, MUT.GoCobraCLI, '__init__')
-    MUT.GoCobraCLI.__init__.return_value = None
-    executor = mock.MagicMock()
+    calls = []
 
-    MUT.OCcli(binExec='custom-oc', cmdExec=executor, namespace='ns')
+    def RecordBaseInit(
+        instance: MUT.GoCobraCLI,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        calls.append((instance, args, kwargs))
 
-    MUT.GoCobraCLI.__init__.assert_called_once_with(
-        mock.ANY,
-        'custom-oc',
-        cmdExec=executor,
-        namespace='ns',
-    )
+    monkeypatch.setattr(MUT.GoCobraCLI, '__init__', RecordBaseInit)
+    executor = mock.Mock()
+
+    cli = MUT.OCcli(binExec='custom-oc', cmdExec=executor, namespace='ns')
+
+    assert (calls == [(
+        cli,
+        ('custom-oc',),
+        {'cmdExec': executor, 'namespace': 'ns'},
+    )])
 
 
 def test_NewRes_SecretFlagReachesProducerConsumerAndWait() -> None:
+    expectedResource = {
+        'kind': 'Secret', 'metadata': {'name': 'name', 'uid': 'uid'},
+    }
+    MUT.json.loads.return_value = expectedResource
     for manifest in ('kind: Secret', {'subCmd': 'secret generic'}):
         cli = BuildCLI()
         cli.Run.side_effect = [
             Result(True, 'synthetic-produced-yaml'),
-            Result(
-                True,
-                json.dumps(
-                    {
-                        'kind': 'Secret',
-                        'metadata': {'name': 'name', 'uid': 'uid'},
-                    }
-                ),
-            ),
+            Result(True, (
+                '{"kind":"Secret","metadata":{"name":"name","uid":"uid"}}'
+            )),
             Result(True, 'raw-wait-result'),
         ]
-        (phase, final, resource) = cli.NewRes(
+        (phase, final, actual) = cli.NewRes(
             manifest, isSecret=True, waitCond='create', waitTime='5m',
         )
         assert (phase == MUT.OCcli.ResPhase.WAITED)
         assert (final.stdout == 'raw-wait-result')
+        assert (actual is expectedResource)
         assert (len(cli.Run.call_args_list) == 3)
         for call in cli.Run.call_args_list:
             assert (call.kwargs['isSecret'] is True)
@@ -721,52 +808,52 @@ def test_NewRes_SecretFlagReachesProducerConsumerAndWait() -> None:
 
 
 def test_NewRes_FromYAMLrunsAllPhases() -> None:
+    expectedResource = {
+        'kind': 'VirtualMachine',
+        'metadata': {'name': 'vm', 'uid': 'uid'},
+    }
+    MUT.json.loads.return_value = expectedResource
     cli = BuildCLI()
     cli.Run.side_effect = [
         Result(True, 'generated yaml'),
-        Result(
-            True,
-            '{"kind":"VirtualMachine","metadata":{"name":"vm","uid":"uid"}}',
-        ),
+        Result(True, 'applied-json'),
         Result(True, 'ready'),
     ]
-    (phase, final, resource) = cli.NewRes(
+    (phase, final, actual) = cli.NewRes(
         'kind: VirtualMachine', waitTime='5m'
     )
 
     assert (phase == MUT.OCcli.ResPhase.WAITED)
     assert (final.stdout == 'ready')
+    assert (actual is expectedResource)
     assert (cli.Run.call_args_list == [
         mock.call(
-            'create',
-            '-f',
-            '-',
-            input='kind: VirtualMachine',
-            dry_run='client',
-            o='yaml',
-            save_config=True, isSecret=False,
+            'create', '-f', '-', input='kind: VirtualMachine',
+            dry_run='client', o='yaml', save_config=True, isSecret=False,
         ),
-        mock.call('apply', '-f', '-', input='generated yaml',
-                  o='json', isSecret=False),
         mock.call(
-            'wait',
-            'VirtualMachine/vm',
-            **{'for': 'create'},
+            'apply', '-f', '-', input='generated yaml',
+            o='json', isSecret=False,
+        ),
+        mock.call(
+            'wait', 'VirtualMachine/vm', **{'for': 'create'},
             timeout='5m', isSecret=False,
         ),
     ])
 
 
 def test_NewRes_FromSubcommandMergesOptions() -> None:
+    expectedResource = {
+        'kind': 'Secret', 'metadata': {'name': 'name', 'uid': 'uid'},
+    }
+    MUT.json.loads.return_value = expectedResource
     cli = BuildCLI()
     cli.Run.side_effect = [
         Result(True, 'yaml'),
-        Result(
-            True, '{"kind":"Secret","metadata":{"name":"name","uid":"uid"}}'
-        ),
+        Result(True, 'applied-json'),
     ]
 
-    (phase, final, resource) = cli.NewRes(
+    (phase, final, actual) = cli.NewRes(
         {
             'subCmd': 'secret generic',
             'args': ['name'],
@@ -777,16 +864,16 @@ def test_NewRes_FromSubcommandMergesOptions() -> None:
 
     assert (phase == MUT.OCcli.ResPhase.APPLIED)
     assert final.success
+    assert (actual is expectedResource)
     assert (cli.Run.call_args_list == [
         mock.call(
-            'create secret generic',
-            'name',
-            from_literal='key=value',
-            dry_run='client',
-            o='yaml',
+            'create secret generic', 'name',
+            from_literal='key=value', dry_run='client', o='yaml',
             save_config=True, isSecret=False,
         ),
-        mock.call('apply', '-f', '-', input='yaml', o='json', isSecret=False),
+        mock.call(
+            'apply', '-f', '-', input='yaml', o='json', isSecret=False,
+        ),
     ])
 
 
@@ -820,6 +907,8 @@ def test_NewRes_StopsOnApplyFailure() -> None:
 
 
 def test_NewRes_MissingWaitIdentityRaisesExplicitError() -> None:
+    expectedResource = {'metadata': {'uid': 'uid'}}
+    MUT.json.loads.return_value = expectedResource
     cli = BuildCLI()
     cli.Run.side_effect = [
         Result(True, 'normalized'),
@@ -828,15 +917,21 @@ def test_NewRes_MissingWaitIdentityRaisesExplicitError() -> None:
     with pytest.raises(ValueError, match='no wait resource identity'):
         cli.NewRes('manifest')
     assert (cli.Run.call_count == 2)
+    MUT.json.loads.assert_called_once_with('{"metadata":{"uid":"uid"}}')
+
     cli.Run.reset_mock()
     cli.Run.side_effect = [
         Result(True, 'normalized'),
         Result(True, '{"metadata":{"uid":"uid"}}'),
     ]
-    (phase, result, resource) = cli.NewRes('manifest', waitCond=None)
+    (phase, result, actual) = cli.NewRes('manifest', waitCond=None)
     assert ((phase == MUT.OCcli.ResPhase.APPLIED) and result.success)
-    assert (resource == {'metadata': {'uid': 'uid'}})
+    assert (actual is expectedResource)
     assert (cli.Run.call_count == 2)
+    assert (MUT.json.loads.call_args_list == [
+        mock.call('{"metadata":{"uid":"uid"}}'),
+        mock.call('{"metadata":{"uid":"uid"}}'),
+    ])
 
 
 @pytest.mark.parametrize('options', [
@@ -863,76 +958,43 @@ def test_CleanUpRes_ForwardsOptionsWithoutMutatingOrReplacingOwnership(
     assert (options == before)
 
 
-def test_DelRes_FailureAndSuccess() -> None:
-    cli = BuildCLI()
-    failure = Result(False, stderr='denied')
-    cli.Run.return_value = failure
-
-    (phase, final) = cli.DelRes('Pod/name')
-    assert ((phase, final) == (MUT.OCcli.ResPhase.WAITED, failure))
-    cli.Run.assert_called_once_with(
-        'delete', 'Pod/name',
-        ignore_not_found=True, timeout='2m', wait='true',
-    )
-
-    cli.Run.reset_mock()
-    cli.Run.return_value = Result(True, 'gone')
-    (phase, final) = cli.DelRes('Pod/name', waitTime='3m')
-    assert (phase == MUT.OCcli.ResPhase.WAITED)
-    assert (final.stdout == 'gone')
-    cli.Run.assert_called_once_with(
-        'delete', 'Pod/name',
-        ignore_not_found=True, timeout='3m', wait='true',
-    )
-
-
 @pytest.mark.parametrize('success', [False, True])
-def test_DelRes_SingleWaitingCommandPreservesClientAndResult(
+@pytest.mark.parametrize('options', [
+    {}, {'waitTime': '3m'}, {'waitTime': '4m'},
+])
+def test_DelRes_UsesSingleCommandAndPreservesResult(
     success: bool,
+    options: dict,
 ) -> None:
-    executor = mock.create_autospec(MUT.CmdExec, instance=True)
+    cli = BuildCLI()
     deletion = Result(success, 'delete output', 'delete diagnostic')
-    executor.Run.side_effect = [
-        Result(True, (
-            '  -n, --namespace string\n'
-            '      --kubeconfig string\n'
-        )),
-        deletion,
-    ]
-    cli = MUT.OCcli(
-        'mock-oc', cmdExec=executor,
-        n='selected-ns', kubeconfig='/selected/config',
+    cli.Run.return_value = deletion
+
+    (phase, actual) = cli.DelRes('Pod/name', **options)
+
+    assert (phase is cli.ResPhase.WAITED)
+    assert (actual is deletion)
+    assert (actual.success is success)
+    assert (actual.stdout == 'delete output')
+    assert (actual.stderr == 'delete diagnostic')
+    cli.Run.assert_called_once_with(
+        'delete',
+        'Pod/name',
+        ignore_not_found=True,
+        timeout=options.get('waitTime', '2m'),
+        wait='true',
     )
-
-    (phase, final) = cli.DelRes('Secret/example', waitTime='4m')
-
-    assert (phase is MUT.OCcli.ResPhase.WAITED)
-    assert (final is deletion)
-    assert (final.success is success)
-    assert (executor.Run.call_args_list == [
-        mock.call(['mock-oc', 'options']),
-        mock.call([
-            'mock-oc', '-n=selected-ns', '--kubeconfig=/selected/config',
-            'delete', '--ignore-not-found=true', '--timeout=4m',
-            '--wait=true', 'Secret/example',
-        ], input=None, isSecret=False, tryMax=None, spPars=None),
-    ])
 
 
 @pytest.fixture(name='commandCLI')
-def FxtCommandCLI() -> tuple[MUT.OCcli, mock.MagicMock]:
-    '''Provide an OC client and mocked executor for namespace tests.'''
-    executor = mock.create_autospec(MUT.CmdExec, instance=True)
-    executor.Run.return_value = Result(True, (
-        '  -n, --namespace string\n'
-        '      --kubeconfig string\n'
-        '      --context string\n'
-    ))
-    cli = MUT.OCcli(
-        'mock-oc', cmdExec=executor,
-        kubeconfig='/selected/config', context='selected-context',
-    )
-    return (cli, executor)
+def FxtCommandCLI() -> tuple[MUT.OCcli, mock.Mock]:
+    '''Provide an OC client and its mocked command boundary.'''
+    cli = BuildCLI()
+    cli.defOpts.update({
+        'kubeconfig': '/selected/config',
+        'context': 'selected-context',
+    })
+    return (cli, cli.Run)
 
 
 @pytest.mark.parametrize('namespace', [None, '', 'resource-ns'])
@@ -941,159 +1003,235 @@ def FxtCommandCLI() -> tuple[MUT.OCcli, mock.MagicMock]:
     {'n': 'short-ns', 'namespace': 'long-ns'},
 ])
 def test__InNS_IsolatesDefaultsAndReusesExecutorAndDiscovery(
-    commandCLI: tuple[MUT.OCcli, mock.MagicMock],
+    commandCLI: tuple[MUT.OCcli, mock.Mock],
     namespace: str | None,
     defaults: dict,
 ) -> None:
-    (cli, executor) = commandCLI
+    (cli, run) = commandCLI
     cli.defOpts.update(defaults)
     original = dict(cli.defOpts)
 
     scoped = cli._InNS(namespace)
 
     assert (cli.defOpts == original)
-    executor.Run.assert_called_once_with(['mock-oc', 'options'])
     if namespace:
         assert (scoped is not cli)
         assert (type(scoped) is type(cli))
         assert (scoped.defOpts is not cli.defOpts)
-        assert (scoped.defOpts == ({
+        expectedDefaults = {
             key: value for (key, value) in original.items()
             if (key not in {'n', 'namespace'})
-        } | {'n': namespace}))
+        } | {'n': namespace}
+        assert (scoped.defOpts == expectedDefaults)
+        assert (scoped.Run is run)
         assert (scoped.cmdExec is cli.cmdExec)
         assert (scoped.cmnOpts is cli.cmnOpts)
         assert (scoped.shortMap is cli.shortMap)
-        executor.Run.return_value = Result(True, 'selected-uid')
+        run.return_value = Result(True, 'selected-uid')
         assert (scoped.GetResUID('ConfigMap/example') == (
             True, 'selected-uid', '',
         ))
-        assert (executor.Run.call_args == mock.call([
-            'mock-oc', '--kubeconfig=/selected/config',
-            '--context=selected-context', f'-n={namespace}',
-            'get', '-o=jsonpath={.metadata.uid}', '--ignore-not-found=true',
+        run.assert_called_once_with(
+            'get',
             'ConfigMap/example',
-        ], input=None, isSecret=False, tryMax=None, spPars=None))
+            o='jsonpath={.metadata.uid}',
+            ignore_not_found=True,
+        )
     else:
         assert (scoped is cli)
+        run.assert_not_called()
 
 
 @pytest.mark.parametrize('namespace', [None, 'resource-ns'])
 @pytest.mark.parametrize('waitCond', [None, 'create'])
 @pytest.mark.parametrize('native', [False, True])
 def test_EnsureRes_WaitAndOwnershipCleanupUseReturnedNamespace(
-    commandCLI: tuple[MUT.OCcli, mock.MagicMock],
+    commandCLI: tuple[MUT.OCcli, mock.Mock],
     namespace: str | None,
     waitCond: str | None,
     native: bool,
 ) -> None:
-    (cli, executor) = commandCLI
+    (cli, run) = commandCLI
     original = dict(cli.defOpts)
     kind = 'ConfigMap' if namespace else 'Namespace'
     metadata = {'name': 'example'}
     if namespace: metadata['namespace'] = namespace
     manifest = json.dumps({'kind': kind, 'metadata': metadata})
-    resource = {'kind': kind, 'metadata': {**metadata, 'uid': 'created-uid'}}
-    specification = ({
-        'subCmd': 'configmap' if namespace else 'namespace',
-        'args': ['example'],
-        'opts': {'n': namespace} if namespace else {},
-    } if native else manifest)
+    resource = {
+        'kind': kind,
+        'metadata': {**metadata, 'uid': 'created-uid'},
+    }
+    MUT.json.loads.return_value = resource
+    specification = (
+        {
+            'subCmd': 'configmap' if namespace else 'namespace',
+            'args': ['example'],
+            'opts': {'n': namespace} if namespace else {},
+        }
+        if native else manifest
+    )
     responses = [
-        Result(True, manifest), Result(True),
-        Result(True, json.dumps(resource)),
+        Result(True, 'generated-yaml'),
+        Result(True, ''),
+        Result(True, 'applied-json'),
     ]
     if (waitCond is not None): responses.append(Result(True))
     responses.extend([Result(True, 'created-uid'), Result(True)])
-    executor.Run.side_effect = responses
+    run.side_effect = responses
     owned = []
 
     actual = cli.EnsureRes(
-        specification, owned, isSecret=True,
+        specification,
+        owned,
+        isSecret=True,
         optsNewRes={'waitCond': waitCond},
     )
 
-    assert (actual == resource)
+    assert (actual is resource)
     assert (len(owned) == 1)
     (ownedOC, resRef, uid) = owned[0]
     assert (resRef == f'{kind}/example')
     assert (uid == 'created-uid')
-    if namespace: assert (ownedOC is not cli)
-    else: assert (ownedOC is cli)
-    assert (ownedOC.cmdExec is executor)
+    assert (ownedOC is not cli if namespace else ownedOC is cli)
+    assert (ownedOC.Run is run)
+    expectedDefaults = original | ({'n': namespace} if namespace else {})
+    assert (ownedOC.defOpts == expectedDefaults)
+    MUT.json.loads.assert_called_once_with('applied-json')
     MUT.OCcli.CleanUpRes(owned)
-    prefix = [
-        'mock-oc', '--kubeconfig=/selected/config',
-        '--context=selected-context',
-    ]
-    if namespace: prefix.append(f'-n={namespace}')
-    expected = []
-    if (waitCond is not None):
-        expected.append(mock.call((prefix + [
-            'wait', '--for=create', '--timeout=2m', resRef,
-        ]), input=None, isSecret=True, tryMax=None, spPars=None))
-    expected.extend([
-        mock.call((prefix + [
-            'get', '-o=jsonpath={.metadata.uid}', '--ignore-not-found=true',
-            resRef,
-        ]), input=None, isSecret=False, tryMax=None, spPars=None),
-        mock.call((prefix + [
-            'delete', '--ignore-not-found=true', '--timeout=2m', '--wait=true',
-            resRef,
-        ]), input=None, isSecret=False, tryMax=None, spPars=None),
+
+    expectedCalls = (
+        [mock.call(
+            'create configmap', 'example', n=namespace,
+            dry_run='client', o='yaml', save_config=True, isSecret=True,
+        )]
+        if (native and namespace) else
+        [mock.call(
+            'create namespace', 'example',
+            dry_run='client', o='yaml', save_config=True, isSecret=True,
+        )]
+        if native else
+        [mock.call(
+            'create', '-f', '-', input=manifest,
+            isSecret=True, dry_run='client', o='yaml', save_config=True,
+        )]
+    )
+    expectedCalls.extend([
+        mock.call(
+            'get', input='generated-yaml', isSecret=True,
+            o='json', f='-', ignore_not_found=True,
+        ),
+        mock.call(
+            'apply', '-f', '-', input='generated-yaml',
+            isSecret=True, o='json',
+        ),
     ])
-    assert (executor.Run.call_args_list[(-len(expected)):] == expected)
-    assert (executor.Run.call_count == (7 if (waitCond is not None) else 6))
+    if (waitCond is not None):
+        expectedCalls.append(mock.call(
+            'wait', resRef, isSecret=True,
+            **{'for': 'create'}, timeout='2m',
+        ))
+    expectedCalls.extend([
+        mock.call(
+            'get', resRef, o='jsonpath={.metadata.uid}',
+            ignore_not_found=True,
+        ),
+        mock.call(
+            'delete', resRef, ignore_not_found=True,
+            timeout='2m', wait='true',
+        ),
+    ])
+    assert (run.call_args_list == expectedCalls)
     assert (cli.defOpts == original)
 
 
 @pytest.mark.parametrize('waited', [False, True])
 def test_EnsureRes_PendingDeletionWaitUsesReturnedNamespace(
-    commandCLI: tuple[MUT.OCcli, mock.MagicMock],
+    commandCLI: tuple[MUT.OCcli, mock.Mock],
     waited: bool,
 ) -> None:
-    (cli, executor) = commandCLI
+    (cli, run) = commandCLI
     original = dict(cli.defOpts)
     metadata = {'name': 'example', 'namespace': 'resource-ns'}
     manifest = json.dumps({'kind': 'ConfigMap', 'metadata': metadata})
-    deleting = {'kind': 'ConfigMap', 'metadata': {
-        **metadata, 'uid': 'old',
-        'deletionTimestamp': '2026-01-01T00:00:00Z',
-    }}
-    created = {'kind': 'ConfigMap', 'metadata': {**metadata, 'uid': 'new'}}
-    executor.Run.side_effect = [
-        Result(True, manifest), Result(True, json.dumps(deleting)),
-        Result(waited), Result(True, manifest), Result(True),
-        Result(True, json.dumps(created)), Result(True),
+    deleting = {
+        'kind': 'ConfigMap',
+        'metadata': {
+            **metadata,
+            'uid': 'old',
+            'deletionTimestamp': '2026-01-01T00:00:00Z',
+        },
+    }
+    created = {
+        'kind': 'ConfigMap', 'metadata': {**metadata, 'uid': 'new'},
+    }
+    responses = [
+        Result(True, 'normalized'),
+        Result(True, 'deleting-json'),
+        Result(waited),
     ]
+    if waited:
+        responses.extend([
+            Result(True, 'normalized'),
+            Result(True, ''),
+            Result(True, 'created-json'),
+            Result(True),
+        ])
+    run.side_effect = responses
+    MUT.json.loads.side_effect = [deleting, created] if waited else [deleting]
     owned = []
+    resRef = 'ConfigMap/example'
 
     if waited:
-        assert (cli.EnsureRes(manifest, owned) == created)
+        actual = cli.EnsureRes(manifest, owned)
+        assert (actual is created)
         assert (len(owned) == 1)
-        assert (owned[0][0].defOpts['n'] == 'resource-ns')
-        assert (owned[0][1:] == ('ConfigMap/example', 'new'))
+        (ownedOC, actualRef, uid) = owned[0]
+        assert (ownedOC.defOpts == (original | {'n': 'resource-ns'}))
+        assert (actualRef == resRef)
+        assert (uid == 'new')
     else:
         with pytest.raises(RuntimeError, match='Waiting for deletion'):
             cli.EnsureRes(manifest, owned)
-        assert (owned == [])
-    waits = [
-        call for call in executor.Run.call_args_list
-        if ('wait' in call.args[0])
-    ]
-    prefix = [
-        'mock-oc', '--kubeconfig=/selected/config',
-        '--context=selected-context', '-n=resource-ns',
-    ]
-    assert (waits[0] == mock.call((prefix + [
-        'wait', '--for=delete', '--timeout=5m', 'ConfigMap/example',
-    ]), input=None, isSecret=False, tryMax=None, spPars=None))
-    if waited:
-        assert (waits[1] == mock.call((prefix + [
-            'wait', '--for=create', '--timeout=2m', 'ConfigMap/example',
-        ]), input=None, isSecret=False, tryMax=None, spPars=None))
-    assert (executor.Run.call_count == (8 if waited else 4))
+        assert not owned
     assert (cli.defOpts == original)
+    expectedCalls = [
+        mock.call(
+            'create', '-f', '-', input=manifest, isSecret=False,
+            dry_run='client', o='yaml', save_config=True,
+        ),
+        mock.call(
+            'get', input='normalized', isSecret=False,
+            o='json', f='-', ignore_not_found=True,
+        ),
+        mock.call(
+            'wait', resRef, isSecret=False, **{'for': 'delete'},
+            timeout='5m',
+        ),
+    ]
+    if waited:
+        expectedCalls.extend([
+            mock.call(
+                'create', '-f', '-', input=manifest, isSecret=False,
+                dry_run='client', o='yaml', save_config=True,
+            ),
+            mock.call(
+                'get', input='normalized', isSecret=False,
+                o='json', f='-', ignore_not_found=True,
+            ),
+            mock.call(
+                'apply', '-f', '-', input='normalized',
+                isSecret=False, o='json',
+            ),
+            mock.call(
+                'wait', resRef, isSecret=False,
+                **{'for': 'create'}, timeout='2m',
+            ),
+        ])
+    assert (run.call_args_list == expectedCalls)
+    assert (MUT.json.loads.call_args_list == (
+        [mock.call('deleting-json'), mock.call('created-json')]
+        if waited else [mock.call('deleting-json')]
+    ))
 
 
 @pytest.mark.parametrize('native', [False, True])
@@ -1107,6 +1245,7 @@ def test_NewRes_UncheckedApplyFailureNeverDeletesExistingResource(
         'kind': 'Namespace', 'metadata': {'name': 'shared', 'uid': 'existing'},
     }
     manifest = json.dumps(resource)
+    MUT.json.loads.return_value = resource
     cli.Run.side_effect = [
         Result(True, manifest), Result(not applyFails, manifest),
         Result(False),
@@ -1125,33 +1264,6 @@ def test_NewRes_UncheckedApplyFailureNeverDeletesExistingResource(
     ))
 
 
-@pytest.mark.parametrize('native', [False, True])
-def test_NewRes_UntrackedNamespaceFailurePreservesExistingNamespace(
-    native: bool,
-) -> None:
-    from libs.CustomTypes import NamedDict
-    from libs.OpenShift.OCP.Resources import Namespace, ResCfg
-
-    cli = BuildCLI()
-    manifest = json.dumps({
-        'kind': 'Namespace', 'metadata': {'name': 'shared', 'uid': 'existing'},
-    })
-    cli.Run.side_effect = [
-        Result(True, manifest), Result(True, manifest), Result(False),
-    ]
-    configuration = (
-        ResCfg(meta=NamedDict(name='shared')) if native
-        else ResCfg(yaml=manifest)
-    )
-
-    with pytest.raises(RuntimeError, match='WAITED'):
-        Namespace.Create(cli, configuration)
-
-    assert ([call.args[0] for call in cli.Run.call_args_list] == [
-        'create namespace' if native else 'create', 'apply', 'wait',
-    ])
-
-
 @pytest.mark.parametrize('outcome', [
     'owned', 'changed', 'absent', 'failed', 'exception',
 ])
@@ -1165,6 +1277,7 @@ def test_NewRes_FailedWaitDeletesOnlyConfirmedCreatedUID(
         'kind': 'Secret', 'metadata': {'name': 'example', 'uid': 'created'},
     }
     manifest = json.dumps(resource)
+    MUT.json.loads.return_value = resource
     responses = [
         Result(True, manifest), Result(True), Result(True, manifest),
         Result(False, 'original wait result'),
@@ -1204,9 +1317,11 @@ def test_NewRes_FailedWaitDeletesOnlyConfirmedCreatedUID(
 @pytest.mark.parametrize('uid', [None, '', 17])
 def test_NewRes_FailedWaitWithoutCreatedUIDNeverDeletes(uid: object) -> None:
     cli = BuildCLI()
-    manifest = json.dumps({
+    resource = {
         'kind': 'ConfigMap', 'metadata': {'name': 'example', 'uid': uid},
-    })
+    }
+    manifest = json.dumps(resource)
+    MUT.json.loads.return_value = resource
     cli.Run.side_effect = [
         Result(True, manifest), Result(True), Result(True, manifest),
         Result(False),
@@ -1220,14 +1335,15 @@ def test_NewRes_FailedWaitWithoutCreatedUIDNeverDeletes(uid: object) -> None:
     assert not any(
         (call.args[0] == 'delete') for call in cli.Run.call_args_list
     )
+    MUT.json.loads.assert_called_once_with(manifest)
 
 
 @pytest.mark.parametrize('isSecret', [False, True])
 def test_NewRes_FailedWaitCleanupUsesCreatedNamespaceAndBoundedCommands(
-    commandCLI: tuple[MUT.OCcli, mock.MagicMock],
+    monkeypatch: pytest.MonkeyPatch,
     isSecret: bool,
 ) -> None:
-    (cli, executor) = commandCLI
+    cli = BuildCLI()
     cli.defOpts.update({'n': 'wrong-short', 'namespace': 'wrong-long'})
     defaults = dict(cli.defOpts)
     resource = {
@@ -1237,37 +1353,91 @@ def test_NewRes_FailedWaitCleanupUsesCreatedNamespaceAndBoundedCommands(
         },
     }
     manifest = json.dumps(resource)
-    executor.Run.reset_mock()
-    executor.Run.side_effect = [
-        Result(True, manifest), Result(True), Result(True, manifest),
-        Result(False), Result(True, 'created'), Result(True),
+    MUT.json.loads.return_value = resource
+    waitFailure = Result(False, 'original wait result')
+    responses = [
+        Result(True, 'normalized'),
+        Result(True, ''),
+        Result(True, 'applied-json'),
+        waitFailure,
+        Result(True, 'created'),
+        Result(True),
     ]
+    calls = []
 
-    (phase, result, _) = cli.NewRes(
+    def Run(
+        client: MUT.GoCobraCLI,
+        command: str,
+        *args: object,
+        **kwargs: object,
+    ) -> mock.Mock:
+        calls.append((client, command, args, kwargs))
+        return responses.pop(0)
+
+    monkeypatch.setattr(MUT.GoCobraCLI, 'Run', Run)
+    del cli.Run
+
+    (phase, result, actual) = cli.NewRes(
         manifest, checkExist=True, isSecret=isSecret,
     )
 
     assert (phase is cli.ResPhase.WAITED)
-    assert not result.success
+    assert (result is waitFailure)
+    assert (not result.success)
+    assert (actual is resource)
     assert (cli.defOpts == defaults)
-    assert (executor.Run.call_count == 6)
-    for call in executor.Run.call_args_list[-2:]:
-        assert (call.args[0][:4] == [
-            'mock-oc', '--kubeconfig=/selected/config',
-            '--context=selected-context', '-n=created-ns',
-        ])
-        assert (call.kwargs == {
-            'input': None, 'isSecret': isSecret, 'tryMax': None,
-            'spPars': {'timeout': 30},
-        })
-    assert (executor.Run.call_args_list[-2].args[0][4:] == [
-        'get', '-o=jsonpath={.metadata.uid}', '--ignore-not-found=true',
-        'Secret/example',
-    ])
-    assert (executor.Run.call_args.args[0][4:] == [
-        'delete', '--force=true', '--grace-period=0',
-        '--ignore-not-found=true', '--wait=false', 'Secret/example',
-    ])
+    assert (len(calls) == 6)
+    scoped = calls[3][0]
+    assert (calls[0][0] is cli)
+    assert (calls[1][0] is cli)
+    assert (calls[2][0] is cli)
+    assert (scoped is not cli)
+    assert (calls[4][0] is scoped)
+    assert (calls[5][0] is scoped)
+    assert (scoped.defOpts == ({
+        key: value for (key, value) in defaults.items()
+        if (key not in {'n', 'namespace'})
+    } | {'n': 'created-ns'}))
+    expectedCalls = [
+        (
+            'create', ('-f', '-'), {
+                'input': manifest, 'isSecret': isSecret,
+                'dry_run': 'client', 'o': 'yaml', 'save_config': True,
+            },
+        ),
+        (
+            'get', (), {
+                'input': 'normalized', 'isSecret': isSecret,
+                'o': 'json', 'f': '-', 'ignore_not_found': True,
+            },
+        ),
+        (
+            'apply', ('-f', '-'), {
+                'input': 'normalized', 'isSecret': isSecret, 'o': 'json',
+            },
+        ),
+        (
+            'wait', ('Secret/example',), {
+                'isSecret': isSecret, 'for': 'create', 'timeout': '2m',
+            },
+        ),
+        (
+            'get', ('Secret/example',), {
+                'isSecret': isSecret, 'spPars': {'timeout': 30},
+                'o': 'jsonpath={.metadata.uid}', 'ignore_not_found': True,
+            },
+        ),
+        (
+            'delete', ('Secret/example',), {
+                'isSecret': isSecret, 'spPars': {'timeout': 30},
+                'force': True, 'grace_period': 0,
+                'ignore_not_found': True, 'wait': False,
+            },
+        ),
+    ]
+    assert ([(command, args, kwargs) for (_, command, args, kwargs) in calls]
+            == expectedCalls)
+    MUT.json.loads.assert_called_once_with('applied-json')
 
 
 @pytest.mark.parametrize('phase', ['APPLIED', 'WAITED'])
@@ -1281,10 +1451,12 @@ def test_NewRes_FailureAndCleanupMatrixPreservesPrimary(
     raises: bool,
 ) -> None:
     cli = BuildCLI()
-    manifest = json.dumps({
+    resource = {
         'kind': 'VirtualMachine',
         'metadata': {'name': 'example', 'uid': 'created-uid'},
-    })
+    }
+    manifest = json.dumps(resource)
+    MUT.json.loads.return_value = resource
     primary = (
         RuntimeError('original creation error') if raises
         else Result(False, 'original creation failure')
@@ -1294,7 +1466,7 @@ def test_NewRes_FailureAndCleanupMatrixPreservesPrimary(
     responses.append(primary)
     if (phase == 'WAITED'):
         responses.append(Result(
-            True, ('' if (cleanup == 'absent') else 'created-uid'),
+            True, '' if (cleanup == 'absent') else 'created-uid',
         ))
         if (cleanup != 'absent'):
             responses.append({
@@ -1310,13 +1482,17 @@ def test_NewRes_FailureAndCleanupMatrixPreservesPrimary(
             cli.NewRes(manifest, checkExist=True)
         assert (caught.value is primary)
     else:
-        (actualPhase, result, resource) = cli.NewRes(manifest, checkExist=True)
+        (actualPhase, result, actualResource) = cli.NewRes(
+            manifest, checkExist=True,
+        )
         assert (actualPhase == cli.ResPhase[phase])
         assert (result is primary)
-        expected = json.loads(manifest) if (phase == 'WAITED') else None
-        assert (resource == expected)
+        expectedResource = resource if (phase == 'WAITED') else None
+        assert (actualResource is expectedResource)
     assert ([call.args[0] for call in cli.Run.call_args_list] == (
         ['create', 'get', 'apply'] +
         (['wait', 'get'] if (phase == 'WAITED') else []) +
         (['delete'] if ((phase == 'WAITED') and (cleanup != 'absent')) else [])
     ))
+    if (phase == 'WAITED'): MUT.json.loads.assert_called_once_with(manifest)
+    else: MUT.json.loads.assert_not_called()

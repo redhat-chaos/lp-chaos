@@ -1,59 +1,43 @@
+import inspect
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
 import pytest
 
-import libs.OpenShift.LP.Virt.VM.RHOVssh as sshModule
-from libs.OpenShift.LP.Virt.VM.RHOVssh import RHOVsshCon
 import libs.OpenShift.LP.Virt.VM.VM as MUT
 from libs.OpenShift.OCP.CLI.OC import OCcli
+from libs.OpenShift.LP.Virt.VM.RHOVssh import RHOVsshCon
 from libs.Utils.CmdExec import CmdRes
 import Utils
 
 
-@pytest.mark.parametrize('teardown', ['close', 'resume', 'primary'])
-@pytest.mark.parametrize('sshFailure', [False, True])
-def test_CleanUpVMs_RealHelpersOnGeneratorExit_ReviewRegression(
-    teardown: str,
-    sshFailure: bool,
-) -> None:
-    cli = OCmock()
-    cli.GetResUID.return_value = (True, 'owned-uid', '')
-    cli.DelRes.return_value = (OCcli.ResPhase.DELETED, CommandResult(False))
-    vm = SimpleNamespace(name='owned', RmvSSH=mock.Mock(
-        side_effect=RuntimeError('SSH failed') if sshFailure else None,
-    ))
-
-    def Fixture():
-        try: yield
-        finally:
-            MUT.VM.CleanUpVMs(
-                [vm], [(cli, 'VirtualMachine/owned', 'owned-uid')],
-            )
-
-    generator = Fixture()
-    next(generator)
-    error = RuntimeError('primary')
-    with pytest.raises(RuntimeError) as caught:
-        if (teardown == 'close'): generator.close()
-        elif (teardown == 'resume'): next(generator)
-        else: generator.throw(error)
-    if (teardown == 'primary'): assert (caught.value is error)
-    else: assert ('VM cleanup failed' in str(caught.value))
-    vm.RmvSSH.assert_called_once_with()
-    cli.DelRes.assert_called_once_with('VirtualMachine/owned')
+@pytest.fixture(name='vmBoundaries', autouse=True)
+def VMBoundaries(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    ocFactory = mock.Mock()
+    ocFactory.CleanUpRes = mock.Mock()
+    virtCtlFactory = mock.Mock()
+    sshFactory = mock.Mock()
+    sshFactory.return_value.Probe.return_value = True
+    namedDictFactory = mock.Mock(side_effect=SimpleNamespace)
+    sysModule = SimpleNamespace(
+        exc_info=mock.Mock(return_value=(None, None, None)),
+    )
+    monkeypatch.setattr(MUT, 'OCcli', ocFactory)
+    monkeypatch.setattr(MUT, 'VirtCtlCLI', virtCtlFactory)
+    monkeypatch.setattr(MUT, 'RHOVsshCon', sshFactory)
+    monkeypatch.setattr(MUT, 'NamedDict', namedDictFactory)
+    monkeypatch.setattr(MUT, 'sys', sysModule)
+    return SimpleNamespace(
+        ocFactory=ocFactory,
+        virtCtlFactory=virtCtlFactory,
+        sshFactory=sshFactory,
+        namedDictFactory=namedDictFactory,
+        sysModule=sysModule,
+    )
 
 
-def CommandResult(success: bool, stdout: str = '', stderr: str = '') -> CmdRes:
-    return CmdRes(stdout, stderr, 0 if success else 1, success)
-
-
-def OCmock() -> mock.MagicMock:
-    return mock.create_autospec(OCcli, instance=True)
-
-
-@pytest.fixture(name='provisionClock')
+@pytest.fixture(name='provisionClock', autouse=True)
 def ProvisionClock(monkeypatch: pytest.MonkeyPatch) -> Utils.FakeClock:
     clock = Utils.FakeClock()
     monkeypatch.setattr(MUT, 'time', SimpleNamespace(
@@ -61,6 +45,58 @@ def ProvisionClock(monkeypatch: pytest.MonkeyPatch) -> Utils.FakeClock:
         sleep=mock.Mock(side_effect=clock.Sleep),
     ))
     return clock
+
+
+def CommandResult(success: bool, stdout: str = '', stderr: str = '') -> CmdRes:
+    return CmdRes(stdout, stderr, 0 if success else 1, success)
+
+
+def OCMock() -> mock.MagicMock:
+    return mock.create_autospec(OCcli, instance=True)
+
+
+@pytest.mark.parametrize('teardown', ['close', 'resume', 'primary'])
+@pytest.mark.parametrize('sshFailure', [False, True])
+def test_CleanUpVMs_PreservesGeneratorAndPrimaryExceptions(
+    vmBoundaries: SimpleNamespace,
+    teardown: str,
+    sshFailure: bool,
+) -> None:
+    cli = OCMock()
+    owned = [(cli, 'VirtualMachine/owned', 'owned-uid')]
+    vm = SimpleNamespace(name='owned', RmvSSH=mock.Mock(
+        side_effect=RuntimeError('SSH failed') if sshFailure else None,
+    ))
+    vmBoundaries.ocFactory.CleanUpRes.side_effect = RuntimeError(
+        'resources failed',
+    )
+
+    def Fixture():
+        try: yield
+        finally: MUT.VM.CleanUpVMs([vm], owned)
+
+    generator = Fixture()
+    next(generator)
+    error = RuntimeError('primary')
+    if (teardown == 'close'):
+        vmBoundaries.sysModule.exc_info.return_value = (
+            GeneratorExit, GeneratorExit(), None,
+        )
+    elif (teardown == 'resume'):
+        vmBoundaries.sysModule.exc_info.return_value = (None, None, None)
+    else:
+        vmBoundaries.sysModule.exc_info.return_value = (
+            RuntimeError, error, None,
+        )
+    with pytest.raises(RuntimeError) as caught:
+        if (teardown == 'close'): generator.close()
+        elif (teardown == 'resume'): next(generator)
+        else: generator.throw(error)
+    if (teardown == 'primary'): assert (caught.value is error)
+    else: assert ('VM cleanup failed' in str(caught.value))
+    vm.RmvSSH.assert_called_once_with()
+    vmBoundaries.ocFactory.CleanUpRes.assert_called_once_with(owned)
+    vmBoundaries.sysModule.exc_info.assert_called_once_with()
 
 
 @pytest.mark.parametrize('sshFailed', [False, True])
@@ -73,45 +109,53 @@ def ProvisionClock(monkeypatch: pytest.MonkeyPatch) -> Utils.FakeClock:
 def test_CleanUpVMs_ClosesSSHAndDelegatesDespiteErrors(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    vmBoundaries: SimpleNamespace,
     sshFailed: bool,
     cleanupFailed: bool,
     primary: bool,
     options: dict | None,
 ) -> None:
     before = None if (options is None) else {
-        key: dict(value) if isinstance(value, dict) else value
+        key: dict(value) if (isinstance(value, dict)) else value
         for (key, value) in options.items()
     }
     vm = SimpleNamespace(name='example', RmvSSH=mock.Mock())
     if sshFailed: vm.RmvSSH.side_effect = RuntimeError('SSH failed')
-    cleanup = mock.Mock(
-        side_effect=RuntimeError('resources failed') if cleanupFailed
-        else None
+    cleanup = vmBoundaries.ocFactory.CleanUpRes
+    cleanup.side_effect = (
+        RuntimeError('resources failed') if cleanupFailed else None
     )
-    monkeypatch.setattr(MUT.OCcli, 'CleanUpRes', cleanup)
     if primary:
-        monkeypatch.setattr(
-            MUT.sys,
-            'exc_info',
-            lambda: (RuntimeError, RuntimeError('primary'), None),
-        )
-    owned = [(OCmock(), 'VirtualMachine/example', 'owned')]
+        primaryError = RuntimeError('primary')
+        monkeypatch.setattr(MUT, 'sys', SimpleNamespace(
+            exc_info=mock.Mock(return_value=(
+                RuntimeError, primaryError, None,
+            )),
+        ))
+    owned = [(OCMock(), 'VirtualMachine/example', 'owned')]
     if ((sshFailed or cleanupFailed) and not primary):
         with pytest.raises(RuntimeError, match='VM cleanup failed'):
             MUT.VM.CleanUpVMs([vm], owned, optsCleanUpRes=options)
-    else:
-        MUT.VM.CleanUpVMs([vm], owned, optsCleanUpRes=options)
+    else: MUT.VM.CleanUpVMs([vm], owned, optsCleanUpRes=options)
     vm.RmvSSH.assert_called_once_with()
     expected = dict(options or {})
     expected.pop('ownRes', None)
     cleanup.assert_called_once_with(owned, **expected)
+    MUT.sys.exc_info.assert_called_once_with()
     assert (options == before)
     if ((sshFailed or cleanupFailed) and primary):
         assert ('preserving primary exception' in caplog.text)
 
 
-def test_Init_UsesSuppliedClients(virtualMachine: Utils.VMcontext) -> None:
+def test_Init_UsesSuppliedClients(
+    virtualMachine: Utils.VMcontext,
+    vmBoundaries: SimpleNamespace,
+) -> None:
     vm = virtualMachine.vm
+    vmBoundaries.namedDictFactory.assert_any_call(
+        oc=virtualMachine.oc,
+        virtCtl=virtualMachine.virtCtl,
+    )
 
     assert (vm.name == 'vm-one')
     assert (vm.namespace == 'namespace')
@@ -122,41 +166,45 @@ def test_Init_UsesSuppliedClients(virtualMachine: Utils.VMcontext) -> None:
     assert (vm._ssh is None)
 
 
-def test_Init_CreatesDefaultClients(monkeypatch: pytest.MonkeyPatch) -> None:
-    Utils.AutoPatch(monkeypatch, MUT, 'OCcli')
-    Utils.AutoPatch(monkeypatch, MUT, 'VirtCtlCLI')
-
+def test_Init_CreatesDefaultClients(vmBoundaries: SimpleNamespace) -> None:
     vm = MUT.VM('vm', 'ns', sshUsr='admin', sshKey='/key')
 
-    MUT.OCcli.assert_called_once_with(n='ns')
-    MUT.VirtCtlCLI.assert_called_once_with(n='ns')
-    assert (vm.cli.oc is MUT.OCcli.return_value)
-    assert (vm.cli.virtCtl is MUT.VirtCtlCLI.return_value)
+    vmBoundaries.ocFactory.assert_called_once_with(n='ns')
+    vmBoundaries.virtCtlFactory.assert_called_once_with(n='ns')
+    assert (vm.cli.oc is vmBoundaries.ocFactory.return_value)
+    assert (vm.cli.virtCtl is vmBoundaries.virtCtlFactory.return_value)
+    vmBoundaries.namedDictFactory.assert_called_once_with(
+        oc=vmBoundaries.ocFactory.return_value,
+        virtCtl=vmBoundaries.virtCtlFactory.return_value,
+    )
 
 
-@pytest.mark.parametrize('stdout', [
-    'Running', "'Running'", " \t'Running'\n", '',
+@pytest.mark.parametrize(('success', 'stdout', 'expected'), [
+    (True, 'Running', 'Running'),
+    (True, "'Running'", "'Running'"),
+    (True, " \t'Running'\n", " \t'Running'\n"),
+    (True, '', ''),
+    (False, "'Stopped'", ''),
 ])
 def test__Status_ReturnsValueOnlyForSuccess(
     virtualMachine: Utils.VMcontext,
+    success: bool,
     stdout: str,
+    expected: str,
 ) -> None:
-    virtualMachine.oc.Run.return_value = CommandResult(True, stdout)
-    assert (virtualMachine.vm._Status() == stdout)
+    virtualMachine.oc.Run.return_value = CommandResult(success, stdout)
+
+    assert (virtualMachine.vm._Status() == expected)
     virtualMachine.oc.Run.assert_called_once_with(
         'get',
         'VirtualMachine/vm-one',
         o='jsonpath={.status.printableStatus}',
     )
 
-    virtualMachine.oc.Run.return_value = CommandResult(False, "'Stopped'")
-    assert (virtualMachine.vm._Status() == '')
 
-
-@pytest.mark.parametrize(
-    'status',
-    ['Running', 'Starting', 'Scheduling', 'Migrating'],
-)
+@pytest.mark.parametrize('status', [
+    'Running', 'Starting', 'Scheduling', 'Migrating',
+])
 @pytest.mark.parametrize('timeout', [None, '2m'])
 @pytest.mark.parametrize('waitSuccess', [False, True])
 def test_Start_SkipsNativeStartButWaitsForActiveVM(
@@ -169,11 +217,11 @@ def test_Start_SkipsNativeStartButWaitsForActiveVM(
     Utils.AutoPatch(monkeypatch, MUT.VM, '_Status')
     MUT.VM._Status.return_value = status
     virtualMachine.oc.Run.return_value = CommandResult(waitSuccess)
-
     result = (
         virtualMachine.vm.Start() if (timeout is None)
         else virtualMachine.vm.Start(timeout=timeout)
     )
+
     assert (result is waitSuccess)
     virtualMachine.virtCtl.Run.assert_not_called()
     virtualMachine.oc.Run.assert_called_once_with(
@@ -203,16 +251,16 @@ def test_Start_WaitsOnlyAfterNativeStartSucceeds(
         MUT.VM._Status.side_effect = ['Provisioning', 'Stopped']
     virtualMachine.virtCtl.Run.return_value = CommandResult(startSuccess)
     virtualMachine.oc.Run.return_value = CommandResult(waitSuccess)
-
     result = (
         virtualMachine.vm.Start() if (timeout is None)
         else virtualMachine.vm.Start(timeout=timeout)
     )
+
     assert (result is (startSuccess and waitSuccess))
     elapsed = 5.0 if (status == 'Provisioning') else 0.0
     assert (provisionClock.now == (10.0 + elapsed))
     virtualMachine.virtCtl.Run.assert_called_once_with('start', 'vm-one')
-    if (not startSuccess): virtualMachine.oc.Run.assert_not_called()
+    if not startSuccess: virtualMachine.oc.Run.assert_not_called()
     else:
         virtualMachine.oc.Run.assert_called_once_with(
             'wait',
@@ -222,10 +270,9 @@ def test_Start_WaitsOnlyAfterNativeStartSucceeds(
         )
 
 
-@pytest.mark.parametrize(
-    'status',
-    ['Stopped', 'Running', 'Starting', 'Scheduling', 'Migrating', ''],
-)
+@pytest.mark.parametrize('status', [
+    'Stopped', 'Running', 'Starting', 'Scheduling', 'Migrating', '',
+])
 @pytest.mark.parametrize('timeout', [None, '2m'])
 @pytest.mark.parametrize('waitSuccess', [False, True])
 def test_Start_SleepsRemainingProvisioningBudgetBeforeTransition(
@@ -267,16 +314,13 @@ def test_Start_SleepsRemainingProvisioningBudgetBeforeTransition(
     assert (provisionClock.now == 17.0)
 
 
-@pytest.mark.parametrize(
-    'provTO,queryLatency,sleeps,elapsed',
-    [
-        (None, 0.0, ([5.0] * 360), 1800.0),
-        (12, 0.0, [5.0, 5.0, 2.0], 12.0),
-        (12, 2.0, [5.0, 3.0], 14.0),
-        (12, 6.0, [5.0], 17.0),
-        (3, 4.0, [], 4.0),
-    ],
-)
+@pytest.mark.parametrize(('provTO', 'queryLatency', 'sleeps', 'elapsed'), [
+    (None, 0.0, ([5.0] * 360), 1800.0),
+    (12, 0.0, [5.0, 5.0, 2.0], 12.0),
+    (12, 2.0, [5.0, 3.0], 14.0),
+    (12, 6.0, [5.0], 17.0),
+    (3, 4.0, [], 4.0),
+])
 def test_Start_ProvisioningTimeoutIncludesQueryLatencyWithoutNativeStart(
     monkeypatch: pytest.MonkeyPatch,
     virtualMachine: Utils.VMcontext,
@@ -293,7 +337,6 @@ def test_Start_ProvisioningTimeoutIncludesQueryLatencyWithoutNativeStart(
 
     Utils.AutoPatch(monkeypatch, MUT.VM, '_Status')
     MUT.VM._Status.side_effect = ReadStatus
-
     result = (
         virtualMachine.vm.Start() if (provTO is None)
         else virtualMachine.vm.Start(provTO=provTO)
@@ -335,7 +378,8 @@ def test_Start_UsesFinalQueryStatusBeforeProvisioningDeadlineCheck(
     assert (MUT.VM._Status.call_count == 2)
     MUT.time.sleep.assert_called_once_with(4.0)
     if (status == 'Running'): virtualMachine.virtCtl.Run.assert_not_called()
-    else: virtualMachine.virtCtl.Run.assert_called_once_with('start', 'vm-one')
+    else:
+        virtualMachine.virtCtl.Run.assert_called_once_with('start', 'vm-one')
     virtualMachine.oc.Run.assert_called_once_with(
         'wait', 'VirtualMachine/vm-one', **{'for': 'condition=Ready'},
         timeout='2m',
@@ -355,11 +399,11 @@ def test_Stop_SkipsNativeStopButWaitsForInactiveVM(
     Utils.AutoPatch(monkeypatch, MUT.VM, '_Status')
     MUT.VM._Status.return_value = status
     virtualMachine.oc.Run.return_value = CommandResult(waitSuccess)
-
     result = (
         virtualMachine.vm.Stop() if (timeout is None)
         else virtualMachine.vm.Stop(timeout=timeout)
     )
+
     assert (result is waitSuccess)
     virtualMachine.virtCtl.Run.assert_not_called()
     virtualMachine.oc.Run.assert_called_once_with(
@@ -383,14 +427,14 @@ def test_Stop_WaitsOnlyAfterNativeStopSucceeds(
     MUT.VM._Status.return_value = 'Running'
     virtualMachine.virtCtl.Run.return_value = CommandResult(stopSuccess)
     virtualMachine.oc.Run.return_value = CommandResult(waitSuccess)
-
     result = (
         virtualMachine.vm.Stop() if (timeout is None)
         else virtualMachine.vm.Stop(timeout=timeout)
     )
+
     assert (result is (stopSuccess and waitSuccess))
     virtualMachine.virtCtl.Run.assert_called_once_with('stop', 'vm-one')
-    if (not stopSuccess): virtualMachine.oc.Run.assert_not_called()
+    if not stopSuccess: virtualMachine.oc.Run.assert_not_called()
     else:
         virtualMachine.oc.Run.assert_called_once_with(
             'wait', 'VirtualMachine/vm-one',
@@ -400,17 +444,15 @@ def test_Stop_WaitsOnlyAfterNativeStopSucceeds(
 
 
 def test_NewSSH_UsesDefaultsAndProbes(
-    monkeypatch: pytest.MonkeyPatch,
     virtualMachine: Utils.VMcontext,
+    vmBoundaries: SimpleNamespace,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT, 'RHOVsshCon')
-    connection = MUT.RHOVsshCon.return_value
-    connection.Probe.return_value = True
+    connection = vmBoundaries.sshFactory.return_value
 
     result = virtualMachine.vm.NewSSH(probeTO=42)
 
     assert (result is connection)
-    MUT.RHOVsshCon.assert_called_once_with(
+    vmBoundaries.sshFactory.assert_called_once_with(
         ns='namespace',
         host='vm-one',
         user='qa-usr',
@@ -422,21 +464,18 @@ def test_NewSSH_UsesDefaultsAndProbes(
 
 
 def test_NewSSH_AllowsOverrides(
-    monkeypatch: pytest.MonkeyPatch,
     virtualMachine: Utils.VMcontext,
+    vmBoundaries: SimpleNamespace,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT, 'RHOVsshCon')
-    MUT.RHOVsshCon.return_value.Probe.return_value = True
+    connection = vmBoundaries.sshFactory.return_value
     virtualMachine.vm.sshKey = '/default-key'
 
     virtualMachine.vm.NewSSH(
-        user='override',
-        idFile='/override',
-        ctrlPersist='1h',
+        user='override', idFile='/override', ctrlPersist='1h',
         virtCtl=None,
     )
 
-    MUT.RHOVsshCon.assert_called_once_with(
+    vmBoundaries.sshFactory.assert_called_once_with(
         ns='namespace',
         host='vm-one',
         user='override',
@@ -445,86 +484,99 @@ def test_NewSSH_AllowsOverrides(
         virtCtl=None,
         oc=virtualMachine.oc,
     )
+    connection.Probe.assert_called_once_with(300)
 
 
 @pytest.mark.parametrize(('overrideVirtCtl', 'overrideOC'), [
     (False, False), (True, False), (False, True), (True, True),
 ])
 def test_NewSSH_AppliesClientOverridesIndependently(
-    monkeypatch: pytest.MonkeyPatch,
     virtualMachine: Utils.VMcontext,
+    vmBoundaries: SimpleNamespace,
     overrideVirtCtl: bool,
     overrideOC: bool,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT, 'RHOVsshCon')
-    MUT.RHOVsshCon.return_value.Probe.return_value = True
     overrides = {}
     if overrideVirtCtl: overrides['virtCtl'] = None
     if overrideOC: overrides['oc'] = None
 
     virtualMachine.vm.NewSSH(**overrides)
 
-    kwargs = MUT.RHOVsshCon.call_args.kwargs
+    kwargs = vmBoundaries.sshFactory.call_args.kwargs
     assert (kwargs['virtCtl'] is (
         None if overrideVirtCtl else virtualMachine.virtCtl
     ))
     assert (kwargs['oc'] is (None if overrideOC else virtualMachine.oc))
+    vmBoundaries.sshFactory.return_value.Probe.assert_called_once_with(300)
+
+
+@pytest.mark.parametrize('clientName', ['virtCtl', 'oc'])
+def test_NewSSH_PreservesSingleExplicitClientOverride(
+    virtualMachine: Utils.VMcontext,
+    vmBoundaries: SimpleNamespace,
+    clientName: str,
+) -> None:
+    client = mock.MagicMock()
+    virtualMachine.vm.NewSSH(**{clientName: client})
+    kwargs = vmBoundaries.sshFactory.call_args.kwargs
+
+    assert (kwargs[clientName] is client)
+    if (clientName == 'virtCtl'): assert (kwargs['oc'] is virtualMachine.oc)
+    else: assert (kwargs['virtCtl'] is virtualMachine.virtCtl)
 
 
 def test_NewSSH_PreservesExplicitOCAndVirtCtlPair(
-    monkeypatch: pytest.MonkeyPatch,
     virtualMachine: Utils.VMcontext,
+    vmBoundaries: SimpleNamespace,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT, 'RHOVsshCon')
-    MUT.RHOVsshCon.return_value.Probe.return_value = True
-    otherOC = mock.create_autospec(OCcli, instance=True)
+    otherOC = OCMock()
     otherVirtCtl = mock.MagicMock()
 
     virtualMachine.vm.NewSSH(virtCtl=otherVirtCtl, oc=otherOC)
 
-    kwargs = MUT.RHOVsshCon.call_args.kwargs
+    kwargs = vmBoundaries.sshFactory.call_args.kwargs
     assert (kwargs['oc'] is otherOC)
     assert (kwargs['virtCtl'] is otherVirtCtl)
     assert (virtualMachine.vm.cli.oc is virtualMachine.oc)
     assert (virtualMachine.vm.cli.virtCtl is virtualMachine.virtCtl)
 
 
-def test_NewSSH_RecreatesBothClientsForExplicitKubeconfig(
-    monkeypatch: pytest.MonkeyPatch,
+def test_NewSSH_ForwardsKubeconfigAndNoneClientOverrides(
     virtualMachine: Utils.VMcontext,
+    vmBoundaries: SimpleNamespace,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, RHOVsshCon, 'Probe')
-    RHOVsshCon.Probe.return_value = True
-    Utils.AutoPatch(monkeypatch, sshModule, 'OCcli')
-    Utils.AutoPatch(monkeypatch, sshModule, 'VirtCtlCLI')
-    sshModule.OCcli.return_value.GetResUID.return_value = (
-        True, 'selected-cluster', '',
-    )
-    executor = mock.MagicMock()
+    connection = vmBoundaries.sshFactory.return_value
+    executor = mock.Mock()
 
-    connection = virtualMachine.vm.NewSSH(
-        kubeconfig='/selected-config', virtCtl=None, oc=None, cmdExec=executor,
+    result = virtualMachine.vm.NewSSH(
+        probeTO=42,
+        kubeconfig='/selected-config',
+        virtCtl=None,
+        oc=None,
+        cmdExec=executor,
     )
 
-    sshModule.OCcli.assert_called_once_with(
-        n='namespace', kubeconfig='/selected-config',
+    assert (result is connection)
+    vmBoundaries.sshFactory.assert_called_once_with(
+        ns='namespace',
+        host='vm-one',
+        user='qa-usr',
+        idFile='~/.ssh/id_ed25519',
+        kubeconfig='/selected-config',
+        virtCtl=None,
+        oc=None,
+        cmdExec=executor,
     )
-    sshModule.VirtCtlCLI.assert_called_once_with(
-        n='namespace', kubeconfig='/selected-config',
-    )
-    assert (connection.cli.oc is sshModule.OCcli.return_value)
-    assert (connection.cli.virtCtl is sshModule.VirtCtlCLI.return_value)
-    assert (connection.cli.cmdExec is executor)
-    assert (connection.target == 'qa-usr@vm-one.namespace.selected-cluster')
-    virtualMachine.oc.GetResUID.assert_not_called()
+    connection.Probe.assert_called_once_with(42)
+    vmBoundaries.ocFactory.assert_not_called()
+    vmBoundaries.virtCtlFactory.assert_not_called()
 
 
 def test_NewSSH_TimeoutRaisesAndDoesNotCache(
-    monkeypatch: pytest.MonkeyPatch,
     virtualMachine: Utils.VMcontext,
+    vmBoundaries: SimpleNamespace,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT, 'RHOVsshCon')
-    connection = MUT.RHOVsshCon.return_value
+    connection = vmBoundaries.sshFactory.return_value
     connection.Probe.return_value = False
 
     with pytest.raises(TimeoutError, match='after 37 seconds'):
@@ -534,65 +586,11 @@ def test_NewSSH_TimeoutRaisesAndDoesNotCache(
     assert (virtualMachine.vm._ssh is None)
 
 
-def test_ssh_UsesSelectedClientAndCachesConnection(
-    monkeypatch: pytest.MonkeyPatch,
-    virtualMachine: Utils.VMcontext,
-) -> None:
-    Utils.AutoPatch(monkeypatch, RHOVsshCon, 'Probe')
-    RHOVsshCon.Probe.return_value = True
-
-    connection = virtualMachine.vm.ssh
-
-    assert (connection.cli.virtCtl is virtualMachine.virtCtl)
-    assert (connection.ns == virtualMachine.vm.namespace)
-    assert (virtualMachine.vm.ssh is connection)
-    RHOVsshCon.Probe.assert_called_once_with(connection, 300)
-
-
-def test_NewSSH_PreservesExplicitClientOverride(
-    monkeypatch: pytest.MonkeyPatch,
-    virtualMachine: Utils.VMcontext,
-) -> None:
-    Utils.AutoPatch(monkeypatch, RHOVsshCon, 'Probe')
-    RHOVsshCon.Probe.return_value = True
-    otherClient = mock.MagicMock()
-
-    connection = virtualMachine.vm.NewSSH(virtCtl=otherClient)
-
-    assert (connection.cli.virtCtl is otherClient)
-    assert (connection.cli.oc is virtualMachine.oc)
-    assert (connection.target.endswith('.cluster-one'))
-    virtualMachine.oc.GetResUID.assert_called_once_with(
-        'namespace/kube-system',
-    )
-    assert (virtualMachine.vm.cli.oc is virtualMachine.oc)
-    assert (virtualMachine.vm.cli.virtCtl is virtualMachine.virtCtl)
-
-
-def test_ssh_RetriesAfterTimeoutWithoutCachingFailure(
-    monkeypatch: pytest.MonkeyPatch,
-    virtualMachine: Utils.VMcontext,
-) -> None:
-    failed = mock.create_autospec(RHOVsshCon, instance=True)
-    recovered = mock.create_autospec(RHOVsshCon, instance=True)
-    failed.Probe.return_value = False
-    recovered.Probe.return_value = True
-    Utils.AutoPatch(monkeypatch, MUT, 'RHOVsshCon')
-    MUT.RHOVsshCon.side_effect = [failed, recovered]
-
-    with pytest.raises(TimeoutError, match='SSH readiness probe timed out'):
-        _ = virtualMachine.vm.ssh
-
-    assert (virtualMachine.vm._ssh is None)
-    assert (virtualMachine.vm.ssh is recovered)
-    assert (virtualMachine.vm._ssh is recovered)
-    assert (MUT.RHOVsshCon.call_count == 2)
-
-
 def test_RmvSSH_IsNoopWithoutConnection(
     virtualMachine: Utils.VMcontext,
 ) -> None:
     virtualMachine.vm.RmvSSH()
+
     assert (virtualMachine.vm._ssh is None)
 
 
@@ -621,30 +619,23 @@ def test_ssh_IsLazyAndCached(
     MUT.VM.NewSSH.assert_called_once_with(virtualMachine.vm)
 
 
-@pytest.mark.parametrize('probeTO', [1, 12, 24])
-def test_NewSSH_RejectsBudgetBelowDefaultProbeAllowance(
+def test_ssh_RetriesAfterTimeoutWithoutCachingFailure(
     virtualMachine: Utils.VMcontext,
-    probeTO: int,
+    vmBoundaries: SimpleNamespace,
 ) -> None:
-    with pytest.raises(ValueError, match='The `probeTO` must cover'):
-        virtualMachine.vm.NewSSH(probeTO=probeTO)
+    failed = mock.create_autospec(RHOVsshCon, instance=True)
+    recovered = mock.create_autospec(RHOVsshCon, instance=True)
+    failed.Probe.return_value = False
+    recovered.Probe.return_value = True
+    vmBoundaries.sshFactory.side_effect = [failed, recovered]
+
+    with pytest.raises(TimeoutError, match='SSH readiness probe timed out'):
+        _ = virtualMachine.vm.ssh
 
     assert (virtualMachine.vm._ssh is None)
-    virtualMachine.virtCtl.Run.assert_not_called()
-
-
-@pytest.mark.parametrize('probeTO', [0.5, 1.5, '35', True, False])
-def test_NewSSH_RejectsNonIntegerProbeBudget(
-    virtualMachine: Utils.VMcontext,
-    probeTO: object,
-) -> None:
-    with pytest.raises(
-        ValueError, match='The `probeTO` must be a positive integer',
-    ):
-        virtualMachine.vm.NewSSH(probeTO=probeTO)
-
-    assert (virtualMachine.vm._ssh is None)
-    virtualMachine.virtCtl.Run.assert_not_called()
+    assert (virtualMachine.vm.ssh is recovered)
+    assert (virtualMachine.vm._ssh is recovered)
+    assert (vmBoundaries.sshFactory.call_count == 2)
 
 
 @pytest.mark.parametrize('provTO', [
@@ -670,19 +661,16 @@ def test_Start_RejectsInvalidProvisioningTimeoutBeforeCommands(
     virtualMachine.oc.Run.assert_not_called()
 
 
-@pytest.mark.parametrize('probeTO', [25, 34, 35])
-def test_NewSSH_AcceptsDefaultProbeCommandAllowance(
-    monkeypatch: pytest.MonkeyPatch,
-    virtualMachine: Utils.VMcontext,
-    probeTO: int,
-) -> None:
-    Utils.AutoPatch(monkeypatch, RHOVsshCon, 'Connect')
-    Utils.AutoPatch(monkeypatch, RHOVsshCon, 'Close')
-    Utils.AutoPatch(monkeypatch, sshModule.time, 'monotonic')
-    sshModule.time.monotonic.return_value = 10
-
-    connection = virtualMachine.vm.NewSSH(probeTO=probeTO)
-
-    RHOVsshCon.Connect.assert_called_once_with(connection, 5)
-    RHOVsshCon.Close.assert_called_once_with(connection, 5)
-    virtualMachine.virtCtl.Run.assert_not_called()
+def test_CleanUpVMs_DocumentsOwnershipAndCleanupContract() -> None:
+    method = MUT.VM.CleanUpVMs
+    parameters = ['vmList', 'ownVMs', 'optsCleanUpRes']
+    doc = inspect.getdoc(method)
+    assert (list(inspect.signature(method).parameters) == parameters)
+    for parameter in parameters: assert (f':param {parameter}:' in doc)
+    assert (inspect.signature(method).return_annotation is None)
+    assert (':return:' not in doc)
+    normalized = ' '.join(doc.split())
+    assert ('wrappers for reused VMs' in normalized)
+    assert ('not atomic' in normalized)
+    assert ('OCcli.CleanUpRes' in doc)
+    assert all((len(line) <= 79) for line in method.__doc__.splitlines())

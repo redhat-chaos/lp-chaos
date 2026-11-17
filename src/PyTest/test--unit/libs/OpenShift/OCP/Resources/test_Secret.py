@@ -1,338 +1,624 @@
-import base64
-import csv
+import os
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from typing import Any
 from unittest import mock
 
 import pytest
 import yaml
 
-from libs.CustomTypes import NamedDict
-from libs.OpenShift.OCP.CLI.OC import OCcli
-from libs.OpenShift.OCP.Resources import OwnInf, ResCfg, SpecMismatch
+from libs.OpenShift.OCP.Resources import SpecMismatch
 import libs.OpenShift.OCP.Resources.Secret as MUT
-from libs.Utils.CmdExec import CmdRes
 
 
-def test_Create_InitialParserFailureIsPrivate_ReviewRegression(
-    resourceCLI: mock.MagicMock,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    with pytest.raises(RuntimeError, match='Invalid Secret conf') as err:
-        MUT.Create(resourceCLI, ResCfg(yaml='kind: Secret\ndata: [private'))
-    assert (str(err.value) == 'Invalid Secret conf. (details are suppressed).')
-    assert ('private' not in str(err.value).replace('private details', ''))
-    assert ('[private' not in caplog.text)
-    assert err.value.__suppress_context__
-    resourceCLI.NewRes.assert_not_called()
-    resourceCLI.EnsureRes.assert_not_called()
+def NativeMeta(
+    name: str = 'image-access',
+    namespace: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(name=name, get=mock.Mock(return_value=namespace))
 
 
-@pytest.mark.parametrize('authoritative', [False, True])
-@pytest.mark.parametrize('data', ['!!!!', 'YQ=', 'YQ==\n', 'é'])
-def test_Create_InvalidDesiredBase64_ReviewRegression(
-    secretContext: SimpleNamespace,
-    authoritative: bool,
-    data: str,
-) -> None:
-    cfg = (
-        ResCfg(yaml=yaml.safe_dump({
-            'kind': 'Secret', 'metadata': {'name': 'image-access'},
-            'data': {'key': data},
-        })) if authoritative
-        else ResCfg(
-            meta=NamedDict(name='image-access'),
-            spec=NamedDict(data={'key': data}),
-        )
-    )
-    with pytest.raises(RuntimeError, match='Could not prepare Secret'):
-        MUT.Create(secretContext.cli, cfg)
-    assert (secretContext.directories == [])
-    secretContext.cli.NewRes.assert_not_called()
-    secretContext.cli.EnsureRes.assert_not_called()
-
-
-@pytest.mark.parametrize('authoritative', [False, True])
-@pytest.mark.parametrize('data', ['', 'YQ=='])
-def test_Create_ValidDesiredBase64_ReviewRegression(
-    resourceCLI: mock.MagicMock,
-    authoritative: bool,
-    data: str,
-) -> None:
-    cfg = (
-        ResCfg(yaml=yaml.safe_dump({
-            'kind': 'Secret', 'metadata': {'name': 'image-access'},
-            'data': {'key': data},
-        })) if authoritative
-        else ResCfg(
-            meta=NamedDict(name='image-access'),
-            spec=NamedDict(data={'key': data}),
-        )
-    )
-    def Create(producer, **options):
-        assert options['isSecret']
-        if not authoritative:
-            source = next(csv.reader([producer['opts']['from-file']]))[0]
-            (key, filename) = source.split('=', 1)
-            assert (key == 'key')
-            assert (Path(filename).read_bytes() == base64.b64decode(data))
-        return (OCcli.ResPhase.APPLIED, CmdRes('', '', 0, True), {
-            'data': {'key': data},
-        })
-    resourceCLI.NewRes.side_effect = Create
-    result = MUT.Create(resourceCLI, cfg)
-    assert (result['data'] == {'key': data})
-    resourceCLI.NewRes.assert_called_once()
+def SecretConfig(
+    spec: object,
+    *,
+    namespace: str | None = None,
+    yamlText: str | None = None,
+    native: bool = True,
+) -> SimpleNamespace:
+    meta = NativeMeta(namespace=namespace) if native else None
+    return SimpleNamespace(meta=meta, spec=spec, yaml=yamlText)
 
 
 @pytest.fixture(name='secretContext')
 def SecretContext(
     resourceCLI: mock.MagicMock,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> SimpleNamespace:
-    root = tmp_path / 'csv,quoted"directory'
-    root.mkdir()
-    state = SimpleNamespace(
-        cli=resourceCLI, files=[], producers=[], payloads=[], directories=[],
-        failure=None, override=None, calls=[],
+    '''Provide mocked helpers, parser, codecs, and file collaborators.'''
+    validate = mock.Mock(return_value=None)
+    create = mock.Mock()
+    parser = mock.Mock(side_effect=AssertionError('Unexpected YAML parse'))
+    yamlModule = SimpleNamespace(YAMLError=yaml.YAMLError, safe_load=parser)
+    directoryName = 'tmp-secret,csv"quoted'
+    directory = mock.MagicMock()
+    directory.__enter__.return_value = directoryName
+    directory.__exit__.return_value = False
+    temporaryDirectory = mock.Mock(return_value=directory)
+    streams = []
+    for _ in range(3):
+        stream = mock.MagicMock()
+        stream.__enter__.return_value = stream
+        stream.__exit__.return_value = False
+        streams.append(stream)
+    fromFiles = mock.MagicMock()
+    fromFiles.__enter__.return_value = fromFiles
+    fromFiles.__exit__.return_value = False
+    fromFiles.getvalue.return_value = 'canned-from-file-list\n'
+    stringIO = mock.Mock(return_value=fromFiles)
+    writer = mock.Mock()
+    csvWriter = mock.Mock(return_value=writer)
+    csvModule = SimpleNamespace(writer=csvWriter)
+    decode = mock.Mock(side_effect=AssertionError('Unexpected base64 decode'))
+    base64Module = SimpleNamespace(b64decode=decode)
+    osAPI = mock.Mock()
+    osAPI.O_WRONLY = os.O_WRONLY
+    osAPI.O_CREAT = os.O_CREAT
+    osAPI.O_EXCL = os.O_EXCL
+    osAPI.open.side_effect = [101, 102, 103]
+    osAPI.fdopen.side_effect = streams
+
+    monkeypatch.setattr(MUT, '_ValResCfg', validate)
+    monkeypatch.setattr(MUT, '_ResCreate', create)
+    monkeypatch.setattr(MUT, 'yaml', yamlModule)
+    monkeypatch.setattr(MUT, 'base64', base64Module)
+    monkeypatch.setattr(MUT, 'csv', csvModule)
+    monkeypatch.setattr(MUT, 'StringIO', stringIO)
+    monkeypatch.setattr(MUT, 'TemporaryDirectory', temporaryDirectory)
+    monkeypatch.setattr(MUT, 'os', osAPI)
+    return SimpleNamespace(
+        cli=resourceCLI, validate=validate, create=create, parser=parser,
+        decode=decode, directoryName=directoryName, directory=directory,
+        temporaryDirectory=temporaryDirectory, streams=streams, os=osAPI,
+        fromFiles=fromFiles, stringIO=stringIO, csvWriter=csvWriter,
+        writer=writer,
     )
 
-    def Directory(**kwargs: Any) -> TemporaryDirectory:
-        directory = TemporaryDirectory(dir=root, **kwargs)
-        state.directories.append(Path(directory.name))
-        return directory
 
-    def Resolve(producer: Any, **kwargs: Any) -> dict[str, Any]:
-        assert (kwargs['isSecret'] is True)
-        state.calls.append(kwargs)
-        state.producers.append(producer)
-        if isinstance(producer, str):
-            resource = yaml.safe_load(producer)
-            data = dict(resource.get('data', {}))
-            data.update({
-                key: base64.b64encode(value.encode()).decode()
-                for (key, value) in resource.get('stringData', {}).items()
-            })
-            resource['data'] = data
-        else:
-            assert (producer['subCmd'] == 'secret generic')
-            assert (producer['args'] == ['image-access'])
-            options = producer['opts']
-            sources = options['from-file']
-            data = {}
-            for source in (next(csv.reader([sources]), []) if sources else []):
-                (key, filename) = source.split('=', 1)
-                path = Path(filename)
-                assert (path.name.isdecimal())
-                assert ((path.stat().st_mode & 0o777) == 0o600)
-                assert ((path.parent.stat().st_mode & 0o777) == 0o700)
-                state.files.append(path)
-                value = path.read_bytes()
-                state.payloads.append(value)
-                assert (value.decode(errors='replace') not in str(producer))
-                data[key] = base64.b64encode(value).decode()
-            resource = {'type': options['type'], 'data': data}
-        if state.failure: raise state.failure
-        return (state.override if (state.override is not None) else resource)
+def test_Create_InitialParserFailureIsPrivate(
+    secretContext: SimpleNamespace,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cfg = SecretConfig(
+        object(), yamlText='kind: Secret\ndata: [private', native=False,
+    )
+    failure = yaml.YAMLError('dummy-private-yaml')
+    secretContext.validate.side_effect = failure
 
-    def New(producer: Any, **kwargs: Any) -> tuple[Any, CmdRes, dict]:
-        return (
-            OCcli.ResPhase.APPLIED, CmdRes('', '', 0, True),
-            Resolve(producer, **kwargs),
+    with pytest.raises(RuntimeError) as caught:
+        MUT.Create(secretContext.cli, cfg)
+
+    assert (
+        str(caught.value) ==
+        'Invalid Secret conf. (details are suppressed).'
+    )
+    assert caught.value.__suppress_context__
+    assert ('dummy-private-yaml' not in (str(caught.value) + caplog.text))
+    assert ('[private' not in (str(caught.value) + caplog.text))
+    secretContext.validate.assert_called_once_with(
+        cfg, {'namespace', 'name'}, {'type', 'data', 'stringData'}, 'Secret',
+    )
+    secretContext.create.assert_not_called()
+    secretContext.parser.assert_not_called()
+    secretContext.decode.assert_not_called()
+    secretContext.temporaryDirectory.assert_not_called()
+    secretContext.os.open.assert_not_called()
+
+
+@pytest.mark.parametrize('authoritative', [False, True])
+@pytest.mark.parametrize('data', ['!!!!', 'YQ=', 'YQ==\n', 'é'])
+def test_Create_InvalidDesiredBase64IsSanitized(
+    secretContext: SimpleNamespace,
+    authoritative: bool,
+    data: str,
+) -> None:
+    text = 'kind: Secret\nmetadata:\n  name: image-access\n'
+    cfg = (
+        SecretConfig(object(), yamlText=text, native=False)
+        if authoritative else SecretConfig({'data': {'key': data}})
+    )
+    if authoritative:
+        secretContext.parser.side_effect = None
+        secretContext.parser.return_value = {'data': {'key': data}}
+    secretContext.decode.side_effect = ValueError('invalid desired data')
+
+    with pytest.raises(RuntimeError) as caught:
+        MUT.Create(secretContext.cli, cfg)
+
+    assert (
+        str(caught.value) ==
+        'Could not prepare Secret (private details are suppressed).'
+    )
+    assert caught.value.__suppress_context__
+    secretContext.decode.assert_called_once_with(data, validate=True)
+    secretContext.validate.assert_called_once_with(
+        cfg, {'namespace', 'name'}, {'type', 'data', 'stringData'}, 'Secret',
+    )
+    secretContext.create.assert_not_called()
+    secretContext.temporaryDirectory.assert_not_called()
+    secretContext.os.open.assert_not_called()
+    secretContext.stringIO.assert_not_called()
+    secretContext.csvWriter.assert_not_called()
+    if authoritative: secretContext.parser.assert_called_once_with(text)
+    else: secretContext.parser.assert_not_called()
+
+
+@pytest.mark.parametrize('authoritative', [False, True])
+@pytest.mark.parametrize('data,expectedBytes', [('', b''), ('YQ==', b'a')])
+def test_Create_ValidDesiredBase64ReturnsMockedResource(
+    secretContext: SimpleNamespace,
+    authoritative: bool,
+    data: str,
+    expectedBytes: bytes,
+) -> None:
+    text = 'kind: Secret\nmetadata:\n  name: image-access\n'
+    cfg = (
+        SecretConfig(object(), yamlText=text, native=False)
+        if authoritative else SecretConfig({'data': {'key': data}})
+    )
+    resource = {'type': 'Opaque', 'data': {'key': data}}
+    secretContext.create.return_value = resource
+    secretContext.decode.side_effect = [expectedBytes, expectedBytes]
+    if authoritative:
+        secretContext.parser.side_effect = None
+        secretContext.parser.return_value = {'data': {'key': data}}
+    else:
+        secretContext.fromFiles.getvalue.return_value = (
+            'canned-from-file-list\n'
         )
 
-    def Ensure(producer: Any, owned: list, **kwargs: Any) -> dict:
-        state.owned = owned
-        return Resolve(producer, **kwargs)
-
-    resourceCLI.NewRes.side_effect = New
-    resourceCLI.EnsureRes.side_effect = Ensure
-    monkeypatch.setattr(MUT, 'TemporaryDirectory', Directory)
-    return state
+    assert (MUT.Create(secretContext.cli, cfg) is resource)
+    secretContext.validate.assert_called_once_with(
+        cfg, {'namespace', 'name'}, {'type', 'data', 'stringData'}, 'Secret',
+    )
+    assert (secretContext.decode.call_args_list == [
+        mock.call(data, validate=True), mock.call(data),
+    ])
+    if authoritative:
+        secretContext.parser.assert_called_once_with(text)
+        secretContext.create.assert_called_once_with(
+            secretContext.cli, text, None, True,
+        )
+        secretContext.temporaryDirectory.assert_not_called()
+        secretContext.stringIO.assert_not_called()
+        secretContext.csvWriter.assert_not_called()
+        secretContext.os.open.assert_not_called()
+    else:
+        producer = {
+            'subCmd': 'secret generic', 'args': ['image-access'],
+            'opts': {
+                'from-file': 'canned-from-file-list', 'type': 'Opaque',
+            },
+        }
+        fileSources = [f'key={Path(secretContext.directoryName, "0")}']
+        secretContext.parser.assert_not_called()
+        secretContext.create.assert_called_once_with(
+            secretContext.cli, producer, None, True,
+        )
+        secretContext.stringIO.assert_called_once_with()
+        secretContext.csvWriter.assert_called_once_with(
+            secretContext.fromFiles, lineterminator='\n',
+        )
+        secretContext.writer.writerow.assert_called_once_with(fileSources)
+        secretContext.fromFiles.getvalue.assert_called_once_with()
+        secretContext.temporaryDirectory.assert_called_once_with(
+            prefix='oc--secret--',
+        )
+        secretContext.directory.__enter__.assert_called_once_with()
+        secretContext.directory.__exit__.assert_called_once_with(
+            None, None, None,
+        )
+        secretContext.os.chmod.assert_called_once_with(
+            secretContext.directoryName, 0o0700,
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        secretContext.os.open.assert_called_once_with(
+            Path(secretContext.directoryName, '0'), flags, 0o0600,
+        )
+        secretContext.os.fdopen.assert_called_once_with(101, 'wb')
+        secretContext.streams[0].write.assert_called_once_with(expectedBytes)
+        secretContext.streams[0].__exit__.assert_called_once_with(
+            None, None, None,
+        )
 
 
 @pytest.mark.parametrize('tracked', [False, True])
-@pytest.mark.parametrize('namespace', [None, '', 'workload-ns'])
-def test_Create_NativeBinaryUTF8OverrideAndPrivateCSVFiles(
+@pytest.mark.parametrize('namespace,expectedNamespace', [
+    (None, None), ('', None), ('workload-ns', 'workload-ns'),
+])
+def test_Create_NativeBinaryUTF8UsesPrivateFileInputs(
     secretContext: SimpleNamespace,
     tracked: bool,
     namespace: str | None,
+    expectedNamespace: str | None,
 ) -> None:
-    state = secretContext
-    cfg = ResCfg(
-        meta=NamedDict(name='image-access', namespace=namespace),
-        spec=NamedDict(
-            type='custom-type', data={
-                'binary': base64.b64encode(b'\xff\x00dummy-binary').decode(),
-                'overlap': base64.b64encode(b'dummy-old').decode(),
+    cfg = SecretConfig(
+        {
+            'type': 'custom-type',
+            'data': {
+                'binary': 'binary-input', 'overlap': 'overlap-input',
             },
-            stringData={'overlap': 'dummy-new-\u2603', 'plain': 'dummy-utf8'},
-        ),
+            'stringData': {
+                'overlap': 'dummy-new-☃', 'plain': 'dummy-utf8',
+            },
+        },
+        namespace=namespace,
     )
-    owned = [('caller', 'Secret/caller', 'caller-uid')]
-    result = MUT.Create(state.cli, cfg, (OwnInf(owned) if tracked else None))
-    assert (result['type'] == 'custom-type')
-    assert ({
-        key: base64.b64decode(value)
-        for (key, value) in result['data'].items()
-    } == {
-        'binary': b'\xff\x00dummy-binary',
-        'overlap': 'dummy-new-\u2603'.encode(),
-        'plain': b'dummy-utf8',
-    })
-    options = state.producers[0]['opts']
-    assert (('n' in options) == bool(namespace))
-    if namespace: assert (options['n'] == namespace)
-    assert ('-n' not in options)
-    assert isinstance(options['from-file'], str)
-    assert ('"' in options['from-file'])
-    assert (len(state.files) == 3)
-    assert all(
-        not path.exists()
-        for path in (state.files + state.directories)
+    resource = {
+        'type': 'custom-type',
+        'data': {
+            'binary': 'binary-returned',
+            'overlap': 'overlap-returned',
+            'plain': 'plain-returned',
+        },
+    }
+    secretContext.create.return_value = resource
+    secretContext.decode.side_effect = [
+        b'\xff\x00dummy-binary', b'dummy-old',
+        b'\xff\x00dummy-binary', b'dummy-new-\xe2\x98\x83',
+        b'dummy-utf8',
+    ]
+    ownInf = object() if tracked else None
+
+    assert (MUT.Create(secretContext.cli, cfg, ownInf) is resource)
+    secretContext.validate.assert_called_once_with(
+        cfg, {'namespace', 'name'}, {'type', 'data', 'stringData'}, 'Secret',
     )
-    if tracked:
-        assert (state.owned is owned)
-        assert (state.calls[0]['existResDelTO'] == '5m')
-        state.cli.NewRes.assert_not_called()
-    else:
-        assert (state.calls == [{'isSecret': True}])
-        state.cli.EnsureRes.assert_not_called()
-    assert (owned == [('caller', 'Secret/caller', 'caller-uid')])
+    secretContext.parser.assert_not_called()
+    assert (secretContext.decode.call_args_list == [
+        mock.call('binary-input', validate=True),
+        mock.call('overlap-input', validate=True),
+        mock.call('binary-returned'),
+        mock.call('overlap-returned'),
+        mock.call('plain-returned'),
+    ])
+    fileSources = [
+        f'binary={Path(secretContext.directoryName, "0")}',
+        f'overlap={Path(secretContext.directoryName, "1")}',
+        f'plain={Path(secretContext.directoryName, "2")}',
+    ]
+    options = {'from-file': 'canned-from-file-list', 'type': 'custom-type'}
+    if (expectedNamespace is not None): options['n'] = expectedNamespace
+    producer = {
+        'subCmd': 'secret generic', 'args': ['image-access'], 'opts': options,
+    }
+    secretContext.create.assert_called_once_with(
+        secretContext.cli, producer, ownInf, True,
+    )
+    secretContext.stringIO.assert_called_once_with()
+    secretContext.csvWriter.assert_called_once_with(
+        secretContext.fromFiles, lineterminator='\n',
+    )
+    secretContext.writer.writerow.assert_called_once_with(fileSources)
+    secretContext.fromFiles.getvalue.assert_called_once_with()
+    secretContext.temporaryDirectory.assert_called_once_with(
+        prefix='oc--secret--',
+    )
+    secretContext.directory.__enter__.assert_called_once_with()
+    secretContext.directory.__exit__.assert_called_once_with(None, None, None)
+    secretContext.os.chmod.assert_called_once_with(
+        secretContext.directoryName, 0o0700,
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    secretContext.os.open.assert_has_calls([
+        mock.call(Path(secretContext.directoryName, '0'), flags, 0o0600),
+        mock.call(Path(secretContext.directoryName, '1'), flags, 0o0600),
+        mock.call(Path(secretContext.directoryName, '2'), flags, 0o0600),
+    ])
+    secretContext.os.fdopen.assert_has_calls([
+        mock.call(101, 'wb'), mock.call(102, 'wb'), mock.call(103, 'wb'),
+    ])
+    secretContext.streams[0].write.assert_called_once_with(
+        b'\xff\x00dummy-binary',
+    )
+    secretContext.streams[1].write.assert_called_once_with(
+        b'dummy-new-\xe2\x98\x83',
+    )
+    secretContext.streams[2].write.assert_called_once_with(b'dummy-utf8')
+    for stream in secretContext.streams:
+        stream.__exit__.assert_called_once_with(None, None, None)
+    cfg.meta.get.assert_called_once_with('namespace')
+    secretContext.cli.NewRes.assert_not_called()
+    secretContext.cli.EnsureRes.assert_not_called()
 
 
 def test_Create_EmptyDataUsesDefaultTypeWithoutFromFile(
     secretContext: SimpleNamespace,
 ) -> None:
-    state = secretContext
-    assert (MUT.Create(state.cli, ResCfg(
-        meta=NamedDict(name='image-access'),
-    )) == {'type': 'Opaque', 'data': {}})
-    assert (state.producers[0]['opts'] == {
-        'type': 'Opaque', 'from-file': None,
-    })
-    assert (state.files == [])
-    assert all(not path.exists() for path in state.directories)
+    cfg = SecretConfig({})
+    resource = {'type': 'Opaque', 'data': {}}
+    secretContext.create.return_value = resource
+    secretContext.fromFiles.getvalue.return_value = '\n'
+
+    assert (MUT.Create(secretContext.cli, cfg) is resource)
+    secretContext.decode.assert_not_called()
+    secretContext.create.assert_called_once_with(
+        secretContext.cli,
+        {
+            'subCmd': 'secret generic', 'args': ['image-access'],
+            'opts': {'from-file': None, 'type': 'Opaque'},
+        },
+        None, True,
+    )
+    secretContext.csvWriter.assert_called_once_with(
+        secretContext.fromFiles, lineterminator='\n',
+    )
+    secretContext.writer.writerow.assert_called_once_with([])
+    secretContext.fromFiles.getvalue.assert_called_once_with()
+    secretContext.os.open.assert_not_called()
+    secretContext.os.fdopen.assert_not_called()
+    secretContext.directory.__exit__.assert_called_once_with(None, None, None)
+    secretContext.cli.NewRes.assert_not_called()
+    secretContext.cli.EnsureRes.assert_not_called()
 
 
 @pytest.mark.parametrize('tracked', [False, True])
-def test_Create_AuthoritativeYAMLDeterminesTypeAndData(
+def test_Create_AuthoritativeYAMLUsesParsedSpecAndRawInput(
     secretContext: SimpleNamespace,
     tracked: bool,
 ) -> None:
-    state = secretContext
-    text = yaml.safe_dump({
-        'kind': 'Secret', 'metadata': {'namespace': 'yaml-ns', 'name': 'yaml'},
+    text = 'kind: Secret\nmetadata:\n  name: yaml-secret\n'
+    parsed = {
         'type': 'yaml-type',
-        'data': {'one': base64.b64encode(b'dummy-old').decode()},
-        'stringData': {'one': 'dummy-new-\u2603'},
-    })
-    cfg = ResCfg(meta=None, spec=object(), yaml=text)
-    result = MUT.Create(state.cli, cfg, (OwnInf([]) if tracked else None))
-    assert (result['type'] == 'yaml-type')
-    assert (
-        base64.b64decode(result['data']['one']) == 'dummy-new-\u2603'.encode()
+        'data': {'one': 'encoded-old'},
+        'stringData': {'one': 'dummy-new-☃'},
+    }
+    resource = {'type': 'yaml-type', 'data': {'one': 'encoded-new'}}
+    cfg = SecretConfig(object(), yamlText=text, native=False)
+    secretContext.parser.side_effect = None
+    secretContext.parser.return_value = parsed
+    secretContext.create.return_value = resource
+    secretContext.decode.side_effect = [
+        b'dummy-old', b'dummy-new-\xe2\x98\x83',
+    ]
+    ownInf = object() if tracked else None
+
+    assert (MUT.Create(secretContext.cli, cfg, ownInf) is resource)
+    secretContext.validate.assert_called_once_with(
+        cfg, {'namespace', 'name'}, {'type', 'data', 'stringData'}, 'Secret',
     )
-    assert (state.producers == [text])
-    assert (state.directories == [])
+    secretContext.parser.assert_called_once_with(text)
+    assert (secretContext.decode.call_args_list == [
+        mock.call('encoded-old', validate=True),
+        mock.call('encoded-new'),
+    ])
+    secretContext.create.assert_called_once_with(
+        secretContext.cli, text, ownInf, True,
+    )
+    secretContext.temporaryDirectory.assert_not_called()
+    secretContext.stringIO.assert_not_called()
+    secretContext.csvWriter.assert_not_called()
+    secretContext.os.open.assert_not_called()
+    secretContext.cli.NewRes.assert_not_called()
+    secretContext.cli.EnsureRes.assert_not_called()
 
 
 @pytest.mark.parametrize('spec', [
-    NamedDict(data={'key': 'a'}),
-    NamedDict(stringData={'../bad': 'dummy-sensitive'}),
-    NamedDict(stringData={'key': b'dummy-sensitive'}),
-    NamedDict(data=[]),
+    {'data': {'key': 'a'}},
+    {'stringData': {'../bad': 'dummy-sensitive'}},
+    {'stringData': {'key': b'dummy-sensitive'}},
+    {'data': []},
 ])
 def test_Create_PreparationFailureIsSanitized(
     secretContext: SimpleNamespace,
-    spec: NamedDict,
     caplog: pytest.LogCaptureFixture,
+    spec: dict[str, object],
 ) -> None:
-    state = secretContext
-    with pytest.raises(
-        RuntimeError, match='Could not prepare Secret'
-    ) as caught:
-        MUT.Create(state.cli, ResCfg(
-            meta=NamedDict(name='image-access'), spec=spec,
-        ))
+    cfg = SecretConfig(spec)
+    if (spec == {'data': {'key': 'a'}}):
+        secretContext.decode.side_effect = ValueError('invalid desired data')
+
+    with pytest.raises(RuntimeError) as caught:
+        MUT.Create(secretContext.cli, cfg)
+
+    assert (
+        str(caught.value) ==
+        'Could not prepare Secret (private details are suppressed).'
+    )
     assert caught.value.__suppress_context__
     assert ('dummy-sensitive' not in (str(caught.value) + caplog.text))
-    state.cli.NewRes.assert_not_called()
-    state.cli.EnsureRes.assert_not_called()
+    if (spec == {'data': {'key': 'a'}}):
+        secretContext.decode.assert_called_once_with('a', validate=True)
+    else: secretContext.decode.assert_not_called()
+    secretContext.validate.assert_called_once_with(
+        cfg, {'namespace', 'name'}, {'type', 'data', 'stringData'}, 'Secret',
+    )
+    secretContext.create.assert_not_called()
+    secretContext.parser.assert_not_called()
+    secretContext.temporaryDirectory.assert_not_called()
+    secretContext.stringIO.assert_not_called()
+    secretContext.csvWriter.assert_not_called()
+    secretContext.os.open.assert_not_called()
 
 
 @pytest.mark.parametrize('phase', ['lifecycle', 'write'])
-def test_Create_FailureCleansPrivateFilesAndSuppressesDetails(
+def test_Create_FailureExitsTemporaryDirectoryAndSanitizes(
     secretContext: SimpleNamespace,
-    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     phase: str,
 ) -> None:
-    state = secretContext
     failure = RuntimeError('dummy-sensitive-failure')
-    if (phase == 'lifecycle'): state.failure = failure
-    else:
-        nativeOpen = MUT.os.open
+    cfg = SecretConfig({'stringData': {'key': 'dummy-sensitive-value'}})
+    if (phase == 'lifecycle'): secretContext.create.side_effect = failure
+    else: secretContext.os.open.side_effect = failure
 
-        def Open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
-            if (flags & MUT.os.O_EXCL): raise failure
-            return nativeOpen(path, flags, *args, **kwargs)
+    with pytest.raises(RuntimeError) as caught:
+        MUT.Create(secretContext.cli, cfg)
 
-        monkeypatch.setattr(MUT.os, 'open', Open)
-    with pytest.raises(
-        RuntimeError, match='Could not create Secret'
-    ) as caught:
-        MUT.Create(state.cli, ResCfg(
-            meta=NamedDict(name='image-access'),
-            spec=NamedDict(stringData={'key': 'dummy-sensitive-value'}),
-        ))
+    assert (
+        str(caught.value) ==
+        'Could not create Secret (private details are suppressed).'
+    )
     assert caught.value.__suppress_context__
     assert ('dummy-sensitive' not in (str(caught.value) + caplog.text))
-    assert all(
-        not path.exists()
-        for path in (state.files + state.directories)
+    secretContext.temporaryDirectory.assert_called_once_with(
+        prefix='oc--secret--',
     )
+    secretContext.directory.__exit__.assert_called_once()
+    assert (
+        secretContext.directory.__exit__.call_args.args[0] is RuntimeError
+    )
+    assert (secretContext.directory.__exit__.call_args.args[1] is failure)
+    secretContext.fromFiles.__exit__.assert_called_once()
+    assert (secretContext.fromFiles.__exit__.call_args.args[1] is failure)
+    secretContext.decode.assert_not_called()
+    if (phase == 'lifecycle'): secretContext.create.assert_called_once()
+    else: secretContext.create.assert_not_called()
+    secretContext.cli.NewRes.assert_not_called()
+    secretContext.cli.EnsureRes.assert_not_called()
 
 
-@pytest.mark.parametrize('actual', [
-    {'type': 'wrong', 'data': {}},
-    {'type': 'Opaque', 'data': {'different': 'ZHVtbXk='}},
-])
-def test_Create_MismatchUsesSharedException(
+def test_Create_MismatchRaisesSpecMismatchForWrongType(
     secretContext: SimpleNamespace,
-    actual: dict,
 ) -> None:
-    state = secretContext
-    state.override = actual
+    cfg = SecretConfig({'data': {'key': 'desired-data'}})
+    resource = {'type': 'wrong', 'data': {'key': 'desired-data'}}
+    secretContext.create.return_value = resource
+    secretContext.decode.side_effect = [b'desired', b'desired']
+
     with pytest.raises(SpecMismatch) as caught:
-        MUT.Create(state.cli, ResCfg(meta=NamedDict(name='image-access')))
+        MUT.Create(secretContext.cli, cfg)
+
     assert (type(caught.value) is MUT.SpecMismatch is SpecMismatch)
+    assert (str(caught.value) == 'Resolved Secret has different type or data.')
+    assert (secretContext.decode.call_args_list == [
+        mock.call('desired-data', validate=True), mock.call('desired-data'),
+    ])
+    secretContext.create.assert_called_once_with(
+        secretContext.cli,
+        {
+            'subCmd': 'secret generic', 'args': ['image-access'],
+            'opts': {
+                'from-file': 'canned-from-file-list', 'type': 'Opaque',
+            },
+        },
+        None, True,
+    )
+    secretContext.directory.__exit__.assert_called_once_with(None, None, None)
 
 
-@pytest.mark.parametrize('actual', [{}, {'data': {'key': 'a'}}])
-def test_Create_InvalidConsumerStateIsSanitized(
+def test_Create_MismatchRaisesSpecMismatchForWrongBytes(
     secretContext: SimpleNamespace,
-    actual: dict,
 ) -> None:
-    secretContext.override = actual
-    with pytest.raises(RuntimeError, match='Could not create Secret'):
-        MUT.Create(secretContext.cli, ResCfg(
-            meta=NamedDict(name='image-access'),
-        ))
+    cfg = SecretConfig({'data': {'key': 'desired-data'}})
+    resource = {'type': 'Opaque', 'data': {'key': 'actual-data'}}
+    secretContext.create.return_value = resource
+    secretContext.decode.side_effect = [b'desired', b'actual']
+
+    with pytest.raises(SpecMismatch) as caught:
+        MUT.Create(secretContext.cli, cfg)
+
+    assert (type(caught.value) is MUT.SpecMismatch is SpecMismatch)
+    assert (str(caught.value) == 'Resolved Secret has different type or data.')
+    assert (secretContext.decode.call_args_list == [
+        mock.call('desired-data', validate=True), mock.call('actual-data'),
+    ])
+    secretContext.directory.__exit__.assert_called_once_with(None, None, None)
+
+
+def test_Create_MismatchRaisesSpecMismatchForUnexpectedKey(
+    secretContext: SimpleNamespace,
+) -> None:
+    cfg = SecretConfig({})
+    resource = {'type': 'Opaque', 'data': {'different': 'ZHVtbXk='}}
+    secretContext.create.return_value = resource
+    secretContext.decode.side_effect = [b'dummy']
+    secretContext.fromFiles.getvalue.return_value = '\n'
+
+    with pytest.raises(SpecMismatch) as caught:
+        MUT.Create(secretContext.cli, cfg)
+
+    assert (type(caught.value) is MUT.SpecMismatch is SpecMismatch)
+    assert (str(caught.value) == 'Resolved Secret has different type or data.')
+    secretContext.decode.assert_called_once_with('ZHVtbXk=')
+    secretContext.writer.writerow.assert_called_once_with([])
+    secretContext.directory.__exit__.assert_called_once_with(None, None, None)
+
+
+def test_Create_MismatchRaisesSpecMismatchForMissingActualData(
+    secretContext: SimpleNamespace,
+) -> None:
+    cfg = SecretConfig({'data': {'key': 'desired-data'}})
+    resource = {'type': 'Opaque'}
+    secretContext.create.return_value = resource
+    secretContext.decode.side_effect = [b'desired']
+
+    with pytest.raises(SpecMismatch) as caught:
+        MUT.Create(secretContext.cli, cfg)
+
+    assert (type(caught.value) is MUT.SpecMismatch is SpecMismatch)
+    assert (str(caught.value) == 'Resolved Secret has different type or data.')
+    secretContext.decode.assert_called_once_with('desired-data', validate=True)
+    secretContext.directory.__exit__.assert_called_once_with(None, None, None)
+
+
+def test_Create_InvalidReturnedBase64IsSanitized(
+    secretContext: SimpleNamespace,
+) -> None:
+    cfg = SecretConfig({})
+    resource = {'data': {'key': 'invalid-actual-data'}}
+    secretContext.create.return_value = resource
+    secretContext.fromFiles.getvalue.return_value = '\n'
+    secretContext.decode.side_effect = ValueError('invalid returned data')
+
+    with pytest.raises(RuntimeError) as caught:
+        MUT.Create(secretContext.cli, cfg)
+
+    assert (
+        str(caught.value) ==
+        'Could not create Secret (private details are suppressed).'
+    )
+    assert caught.value.__suppress_context__
+    secretContext.decode.assert_called_once_with('invalid-actual-data')
+    secretContext.create.assert_called_once_with(
+        secretContext.cli,
+        {
+            'subCmd': 'secret generic', 'args': ['image-access'],
+            'opts': {'from-file': None, 'type': 'Opaque'},
+        },
+        None, True,
+    )
+    secretContext.csvWriter.assert_called_once_with(
+        secretContext.fromFiles, lineterminator='\n',
+    )
+    secretContext.writer.writerow.assert_called_once_with([])
+    secretContext.fromFiles.getvalue.assert_called_once_with()
+    secretContext.directory.__exit__.assert_called_once_with(None, None, None)
+    secretContext.cli.NewRes.assert_not_called()
+    secretContext.cli.EnsureRes.assert_not_called()
 
 
 @pytest.mark.parametrize('cfg', [
-    ResCfg(meta=NamedDict(name='one', labels={})),
-    ResCfg(spec=NamedDict(immutable=False)),
-    ResCfg(yaml='kind: Namespace'),
+    SimpleNamespace(meta={'name': 'one', 'labels': {}}, spec={}, yaml=None),
+    SimpleNamespace(meta={}, spec={'immutable': False}, yaml=None),
+    SimpleNamespace(meta={}, spec={}, yaml='kind: Namespace'),
 ])
 def test_Create_ValidationFailurePrecedesPrivateFiles(
     secretContext: SimpleNamespace,
-    cfg: ResCfg,
+    cfg: SimpleNamespace,
 ) -> None:
-    with pytest.raises(ValueError): MUT.Create(secretContext.cli, cfg)
-    assert (secretContext.directories == [])
-    secretContext.cli.NewRes.assert_not_called()
+    failure = ValueError('invalid Secret configuration')
+    secretContext.validate.side_effect = failure
+
+    with pytest.raises(ValueError) as caught:
+        MUT.Create(secretContext.cli, cfg)
+
+    assert (caught.value is failure)
+    secretContext.validate.assert_called_once_with(
+        cfg, {'namespace', 'name'}, {'type', 'data', 'stringData'}, 'Secret',
+    )
+    secretContext.create.assert_not_called()
+    secretContext.parser.assert_not_called()
+    secretContext.decode.assert_not_called()
+    secretContext.temporaryDirectory.assert_not_called()
+    secretContext.stringIO.assert_not_called()
+    secretContext.csvWriter.assert_not_called()
+    secretContext.os.open.assert_not_called()

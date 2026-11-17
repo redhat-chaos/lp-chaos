@@ -23,7 +23,7 @@ class TestBR():
     @pytest.mark.parametrize(
         'fxtVMbyBR,',
         [({
-            'ns': 'bsod-test',
+            'ns': 'br-test',
             'fxtInf': NamedDict(brCfg=NamedDict(count=1)),
         },)],
         indirect=True,

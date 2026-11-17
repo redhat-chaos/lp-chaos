@@ -90,32 +90,54 @@ unchanged. Plain dictionaries cannot override existing non-null `NamedDict` sect
 existing value with `None`.
 
 
-## Test Locations and Examples
+## Test Locations
 
-Put scenarios under `test--suites/` and isolated unit tests under `test--unit/`. The PyTest root's [`conftest.py`](conftest.py) registers the shared CLI, VM,
-benchmark-runner, and Krkn fixtures for scenario tests. Use indirect parametrization for configuration and normal assertions for outcomes.
-
-- `vm`: [direct VM example](test--suites/ts--example/test_VM.py) creates a VM and asserts a guest PowerShell response.
-- `vm__br`: [benchmark-runner examples](test--suites/ts--example/test_BenchmarkRunner.py) include two VM Ready checks and a skipped legacy guest
-  SSH/file-transfer test.
-- `krkn`: [Krkn examples](test--suites/ts--example/test_Krkn.py) are skipped launcher-Pod/host-observation placeholders.
-
-Adapt all environment-specific values. No current example implements a complete BSOD detection/analysis workflow. See the
-[BSOD roadmap](docs/roadmap--krkn--bsod.md) for planned work.
-
-
-## Discovery and Offline Unit Tests
+Use `test--unit/` for isolated Python-module tests, `test--contract/` for offline template contracts, and `test--suites/` for live CUT scenarios.
 
 Tests MUST be invoked via `python -m pytest ...`. Direct invocation via `pytest ...` MUST NOT be used. See
 [LibInVenv module documentation](libs/Utils/LibInVenv.py) for details.
 
-From `src/PyTest/`, use the existing test environment to inspect selection without executing fixture setup:
+Run the commands below from `src/PyTest/` using the existing test environment.
+
+
+### Unit Tests
+
+Each unit test MUST test only its corresponding module. All external calls MUST be mocked, including built-ins such as `open()`.
+
+Use the separate `pytest--unit.ini` configuration:
 ```bash
-python -m pytest -c pytest.ini test--suites/ --collect-only
-python -m pytest -c pytest.ini test--suites/ -m vm__br --collect-only
-python -m pytest -c pytest.ini test--suites/ -m krkn --collect-only
 python -m pytest -c pytest--unit.ini test--unit/
 ```
 
+
+### Offline Template Contract Tests
+
+The VM-template contracts are in [`test--contract/test_YAML_confTemplate.py`](test--contract/test_YAML_confTemplate.py). They read the template under
+`conf/VM/` and use real Jinja rendering and YAML parsing, rather than mocking those collaborators as isolated unit tests do.
+
+Use `pytest--contract.ini` to select them explicitly.
+```bash
+python -m pytest -c pytest--contract.ini
+```
+
+
+### Live Test Suites
+
+Put live CUT scenarios under `test--suites/` (examples are in `test--suites/ts--example/`). The root [`conftest.py`](conftest.py) registers the
+[fixtures](#choose-a-fixture). Use indirect parametrization for configuration and normal assertions for outcomes.
+
+Markers in the `ts--example/`:
+  - `vm`: [direct VM example](test--suites/ts--example/test_VM.py) creates a VM and asserts a guest PowerShell response.
+  - `vm__br`: [benchmark-runner examples](test--suites/ts--example/test_BenchmarkRunner.py) include two VM Ready checks and a skipped legacy guest
+    SSH/file-transfer test.
+  - `krkn`: [Krkn examples](test--suites/ts--example/test_Krkn.py) are skipped launcher-Pod/host-observation placeholders.
+
+Inspect live-suite selection without executing fixture setup:
+```bash
+python -m pytest -c pytest.ini test--suites/ --collect-only
+python -m pytest -c pytest.ini test--suites/ -m vm --collect-only
+python -m pytest -c pytest.ini test--suites/ -m vm__br --collect-only
+python -m pytest -c pytest.ini test--suites/ -m krkn --collect-only
+```
+
 Only remove `--collect-only` on an authorized, disposable CUT after reviewing the selected tests' creation, disruption, guest-access, and cleanup requirements.
-Unit tests use the separate `pytest--unit.ini` configuration.

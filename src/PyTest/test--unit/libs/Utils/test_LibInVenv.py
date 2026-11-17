@@ -1,15 +1,67 @@
-import os
-from pathlib import Path
-import subprocess
-import sys
-import threading
+from pathlib import PurePosixPath
+from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
 import pytest
 
 import libs.Utils.LibInVenv as MUT
-import Utils
+
+
+class UnitPath(PurePosixPath):
+    '''Use pure path operations without filesystem access.'''
+
+    def expanduser(self) -> 'UnitPath':
+        return self
+
+    def resolve(self) -> 'UnitPath':
+        return self
+
+
+class FalseReceiveError(Exception):
+    '''An exception whose truth value is false.'''
+
+    def __bool__(self) -> bool:
+        return False
+
+
+@pytest.fixture(name='workerContext')
+def WorkerContext(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[MUT.ModInVenv, mock.MagicMock]:
+    context = mock.MagicMock()
+    context.Pipe.return_value = (mock.MagicMock(), mock.MagicMock())
+    context.Process.return_value.exitcode = 0
+    context.Process.return_value.is_alive.return_value = False
+
+    mp = mock.Mock()
+    mp.get_context.return_value = context
+    spawn = mock.Mock()
+    spawn.get_executable.return_value = b'/previous/python'
+    tempEnv = mock.MagicMock()
+    environment = {}
+
+    monkeypatch.setattr(MUT, 'mp', mp)
+    monkeypatch.setattr(MUT, 'spawn', spawn)
+    monkeypatch.setattr(MUT, 'wait', mock.Mock())
+    monkeypatch.setattr(MUT, 'os', SimpleNamespace(
+        name='posix', environ=environment,
+    ))
+    monkeypatch.setattr(MUT, 'Path', UnitPath)
+    monkeypatch.setattr(MUT, 'sys', SimpleNamespace(
+        version_info=(3, 11, 8, 'final', 0),
+    ))
+    monkeypatch.setattr(MUT, 'TempEnv', mock.Mock(return_value=tempEnv))
+    monkeypatch.setattr(MUT, 'UpdEnv', mock.Mock())
+    monkeypatch.setattr(MUT, '_procLock', mock.MagicMock())
+    monkeypatch.setattr(MUT, 'Event', mock.Mock())
+    monkeypatch.setattr(MUT, 'Thread', mock.Mock())
+    monkeypatch.setattr(MUT, 'time', SimpleNamespace(monotonic=mock.Mock()))
+
+    return (
+        MUT.ModInVenv('/unit/venv', importPaths=('/unit/import',)),
+        context,
+    )
 
 
 def test_Call_ReceiveFailureBeforeUnboundedWait_ReviewRegression(
@@ -22,8 +74,10 @@ def test_Call_ReceiveFailureBeforeUnboundedWait_ReviewRegression(
     error = FalseReceiveError('could not reconstruct')
     context.Pipe.return_value[0].recv.side_effect = error
     MUT.wait.side_effect = AssertionError('unbounded wait reached')
+
     with pytest.raises(RuntimeError) as caught:
         worker.Call('target', 'Callable')
+
     assert (caught.value.__cause__ is error)
     MUT.wait.assert_not_called()
     proc.terminate.assert_called_once_with()
@@ -33,52 +87,67 @@ def test_Call_ReceiveFailureBeforeUnboundedWait_ReviewRegression(
 
 
 @pytest.mark.parametrize('execTO', [None, 10])
-def test_Call_ImportsSpawnInFreshInterpreter(execTO: Optional[int]) -> None:
-    sourceRoot = Path(MUT.__file__).resolve().parents[2]
-    code = (
-        'from pathlib import Path\n'
-        'import sys\n'
-        f'sys.path.insert(0, {str(sourceRoot)!r})\n'
-        'import libs.Utils.LibInVenv as MUT\n'
-        f'assert str(Path(MUT.__file__).resolve()) == {MUT.__file__!r}\n'
-        'originalExecutable = MUT.spawn.get_executable()\n'
-        'result = MUT.ModInVenv('
-        f'Path(sys.prefix), execTO={execTO!r}).Call('
-        '"builtins", "str", None, 42)\n'
-        'assert MUT.spawn.get_executable() == originalExecutable\n'
-        'print(result)\n'
+def test_Call_UsesExpectedSpawnConfig(
+    workerContext: tuple[MUT.ModInVenv, mock.MagicMock],
+    execTO: Optional[int],
+) -> None:
+    (worker, context) = workerContext
+    (rcvPipe, sndPipe) = context.Pipe.return_value
+    proc = context.Process.return_value
+    worker = MUT.ModInVenv(
+        worker.venvRoot,
+        importPaths=('/unit/first', '/unit/second'),
+        execTO=execTO,
     )
-    result = subprocess.run(
-        [sys.executable, '-B', '-c', code],
-        capture_output=True, text=True, check=True, timeout=30,
-    )
-    assert (result.stdout == '42\n')
-    assert (result.stderr == '')
+    rcvPipe.recv.return_value = (MUT.ExitType.RETURN, 42)
 
+    if (execTO is not None):
+        MUT.time.monotonic.side_effect = [100, 101, 102]
+        MUT.Event.return_value.wait.return_value = True
+        MUT.Thread.return_value.start.side_effect = (
+            lambda: MUT.Thread.call_args.kwargs['target']()
+        )
+        MUT.wait.return_value = [proc.sentinel]
 
-class FalseReceiveError(Exception):
-    '''A reconstruction error whose truth value is false.'''
+    assert (worker.Call(
+        'target', 'Callable', None, 'positional', option=True,
+    ) == 42)
 
-    def __bool__(self) -> bool:
-        return False
+    MUT.mp.get_context.assert_called_once_with('spawn')
+    context.Pipe.assert_called_once_with(duplex=False)
+    assert (context.Process.call_args.kwargs == {
+        'target': MUT._CallInVenv,
+        'args': (
+            sndPipe, 'target', 'Callable', ('positional',), {'option': True},
+            ('/unit/first', '/unit/second'), '/unit/venv',
+            (3, 11, 8, 'final', 0),
+        ),
+    })
+    proc.start.assert_called_once_with()
+    proc.close.assert_called_once_with()
+    proc.terminate.assert_not_called()
+    proc.kill.assert_not_called()
+    rcvPipe.close.assert_called_once_with()
+    assert sndPipe.close.called
+    MUT.spawn.get_executable.assert_called_once_with()
+    assert (MUT.mp.set_executable.call_args_list == [
+        mock.call('/unit/venv/bin/python'), mock.call(b'/previous/python'),
+    ])
 
-
-@pytest.fixture(name='workerContext')
-def WorkerContext(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> tuple[MUT.ModInVenv, mock.MagicMock]:
-    context = mock.MagicMock()
-    context.Pipe.return_value = (mock.MagicMock(), mock.MagicMock())
-    context.Process.return_value.exitcode = 0
-    context.Process.return_value.is_alive.return_value = False
-    Utils.AutoPatch(monkeypatch, MUT.mp, 'get_context')
-    Utils.AutoPatch(monkeypatch, MUT.mp, 'set_executable')
-    Utils.AutoPatch(monkeypatch, MUT.spawn, 'get_executable')
-    Utils.AutoPatch(monkeypatch, MUT, 'wait')
-    MUT.mp.get_context.return_value = context
-    MUT.spawn.get_executable.return_value = b'/previous/python'
-    return (MUT.ModInVenv(tmp_path), context)
+    if (execTO is None):
+        MUT.Thread.assert_not_called()
+        MUT.Event.assert_called_once_with()
+        MUT.Event.return_value.wait.assert_not_called()
+        MUT.Event.return_value.set.assert_called_once_with()
+        MUT.wait.assert_called_once_with([proc.sentinel])
+        proc.join.assert_called_once_with()
+    else:
+        MUT.Thread.assert_called_once()
+        assert (MUT.Thread.call_args.kwargs['daemon'] is True)
+        MUT.Event.return_value.wait.assert_called_once_with(9)
+        MUT.Event.return_value.set.assert_called_once_with()
+        MUT.wait.assert_called_once_with([proc.sentinel], 8)
+        proc.join.assert_called_once_with(0)
 
 
 @pytest.mark.parametrize('payload', [None, 42, ('ordinary', 'tuple')])
@@ -107,40 +176,29 @@ def test_Call_ReturnsTaggedValueAndReapsChild(
     rcvPipe.close.assert_called_once_with()
     assert sndPipe.close.called
     assert (MUT.mp.set_executable.call_args_list == [
-        mock.call(str(worker.pyPath)), mock.call(b'/previous/python'),
+        mock.call('/unit/venv/bin/python'), mock.call(b'/previous/python'),
     ])
 
 
 @pytest.mark.parametrize('failure', ['none', 'start', 'receive'])
-def test_Call_RestoresEnvironmentAndExecutableAfterStartup(
+def test_Call_ClosesTemporaryEnvironmentAndRestoresExecutable(
     workerContext: tuple[MUT.ModInVenv, mock.MagicMock],
-    monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
     (worker, context) = workerContext
     (rcvPipe, sndPipe) = context.Pipe.return_value
     proc = context.Process.return_value
-    monkeypatch.setenv('UNIT_VENV_REMOVE', 'original')
-    monkeypatch.delenv('UNIT_VENV_MISSING', raising=False)
-    monkeypatch.setenv('UNIT_VENV_VALUE', 'original')
-    monkeypatch.setenv('UNIT_VENV_EMPTY', 'original')
-    beforeEnv = dict(os.environ)
     error = OSError('injected startup failure')
-
-    def Start() -> None:
-        assert ('UNIT_VENV_REMOVE' not in os.environ)
-        assert ('UNIT_VENV_MISSING' not in os.environ)
-        assert (os.environ['UNIT_VENV_VALUE'] == '42')
-        assert (os.environ['UNIT_VENV_EMPTY'] == '')
-        if (failure == 'start'): raise error
-
-    proc.start.side_effect = Start
-    rcvPipe.recv.return_value = (MUT.ExitType.RETURN, None)
-    if (failure == 'receive'): rcvPipe.recv.side_effect = error
     envUpd = {
         'UNIT_VENV_REMOVE': None, 'UNIT_VENV_MISSING': None,
         'UNIT_VENV_VALUE': 42, 'UNIT_VENV_EMPTY': '',
     }
+
+    if (failure == 'start'): proc.start.side_effect = error
+    else:
+        rcvPipe.recv.return_value = (MUT.ExitType.RETURN, None)
+        if (failure == 'receive'): rcvPipe.recv.side_effect = error
+
     if (failure == 'none'):
         assert (worker.Call('target', 'Callable', envUpd) is None)
     else:
@@ -150,37 +208,40 @@ def test_Call_RestoresEnvironmentAndExecutableAfterStartup(
         if (failure == 'start'): assert (raised.value is error)
         else: assert (raised.value.__cause__ is error)
 
-    assert (dict(os.environ) == beforeEnv)
+    MUT.TempEnv.assert_called_once_with()
+    MUT.TempEnv.return_value.__enter__.assert_called_once_with()
+    MUT.TempEnv.return_value.__exit__.assert_called_once()
+    MUT.UpdEnv.assert_called_once_with(envUpd)
     assert (MUT.mp.set_executable.call_args_list == [
-        mock.call(str(worker.pyPath)), mock.call(b'/previous/python'),
+        mock.call('/unit/venv/bin/python'), mock.call(b'/previous/python'),
     ])
     proc.close.assert_called_once_with()
     rcvPipe.close.assert_called_once_with()
     assert sndPipe.close.called
 
 
-def test_Call_RestoresEnvironmentAndExecutableAfterUpdateFailure(
+def test_Call_RestoresExecutableAfterEnvironmentUpdateFailure(
     workerContext: tuple[MUT.ModInVenv, mock.MagicMock],
 ) -> None:
     (worker, context) = workerContext
     (rcvPipe, sndPipe) = context.Pipe.return_value
     proc = context.Process.return_value
-    error = ValueError('synthetic environment conversion failure')
-    value = mock.MagicMock()
-    value.__str__.side_effect = error
-    beforeEnv = dict(os.environ)
+    error = ValueError('synthetic environment update failure')
+    envUpd = {'UNIT_VENV_FIRST': 'temporary', 'UNIT_VENV_BAD': 'invalid'}
+    MUT.UpdEnv.side_effect = error
 
     with pytest.raises(ValueError) as raised:
-        worker.Call('target', 'Callable', {
-            'UNIT_VENV_FIRST': 'temporary', 'UNIT_VENV_BAD': value,
-        })
+        worker.Call('target', 'Callable', envUpd)
 
     assert (raised.value is error)
-    assert (dict(os.environ) == beforeEnv)
-    assert (MUT.mp.set_executable.call_args_list == [
-        mock.call(str(worker.pyPath)), mock.call(b'/previous/python'),
-    ])
+    MUT.TempEnv.assert_called_once_with()
+    MUT.TempEnv.return_value.__enter__.assert_called_once_with()
+    MUT.TempEnv.return_value.__exit__.assert_called_once()
+    MUT.UpdEnv.assert_called_once_with(envUpd)
     proc.start.assert_not_called()
+    assert (MUT.mp.set_executable.call_args_list == [
+        mock.call('/unit/venv/bin/python'), mock.call(b'/previous/python'),
+    ])
     proc.close.assert_called_once_with()
     rcvPipe.close.assert_called_once_with()
     sndPipe.close.assert_called_once_with()
@@ -199,7 +260,7 @@ def test_Call_CleansUpLiveChildAfterReceiveFailure(
     with pytest.raises(RuntimeError) as raised:
         worker.Call('target', 'Callable')
 
-    assert isinstance(raised.value.__cause__, EOFError)
+    assert (isinstance(raised.value.__cause__, EOFError))
     proc.terminate.assert_called_once_with()
     assert (proc.join.call_args_list == (
         [mock.call(1)] * (2 if killRequired else 1)
@@ -207,7 +268,6 @@ def test_Call_CleansUpLiveChildAfterReceiveFailure(
     if killRequired: proc.kill.assert_called_once_with()
     else: proc.kill.assert_not_called()
     proc.close.assert_called_once_with()
-
     MUT.wait.assert_not_called()
 
 
@@ -287,7 +347,7 @@ def test_Call_AbnormalExitRejectsResponseWithoutInvalidCause(
     proc = context.Process.return_value
     proc.exitcode = 9
     exitType = (
-        MUT.ExitType.EXCEPTION if isinstance(payload, BaseException)
+        MUT.ExitType.EXCEPTION if (isinstance(payload, BaseException))
         else MUT.ExitType.RETURN
     )
     rcvPipe.recv.return_value = (exitType, payload)
@@ -296,7 +356,7 @@ def test_Call_AbnormalExitRejectsResponseWithoutInvalidCause(
         worker.Call('target', 'Callable')
 
     assert (str(payload) in str(raised.value))
-    expectedCause = payload if isinstance(payload, BaseException) else None
+    expectedCause = payload if (isinstance(payload, BaseException)) else None
     assert (raised.value.__cause__ is expectedCause)
     proc.join.assert_called_once_with()
     proc.close.assert_called_once_with()
@@ -306,32 +366,26 @@ def test_Call_AbnormalExitRejectsResponseWithoutInvalidCause(
     0, -1, False, True, 0.2, 1.0, '10',
     float('nan'), float('inf'), float('-inf'),
 ])
-def test_Init_RejectsInvalidExecutionBudget(
-    tmp_path: Path,
-    execTO: object,
-) -> None:
+def test_Init_RejectsInvalidExecutionBudget(execTO: object) -> None:
     with pytest.raises(
         ValueError, match='The `execTO` must be a positive integer',
     ):
-        MUT.ModInVenv(tmp_path, execTO=execTO)
+        MUT.ModInVenv('/unit/venv', execTO=execTO)
 
 
 @pytest.fixture(name='boundedWorker')
 def BoundedWorker(
     workerContext: tuple[MUT.ModInVenv, mock.MagicMock],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[MUT.ModInVenv, mock.MagicMock]:
-    '''Provide a bounded worker with deterministic response and exit waits.'''
+    '''Provide deterministic response and exit waits for a bounded worker.'''
     (worker, context) = workerContext
-    Utils.AutoPatch(monkeypatch, MUT, 'Event')
-    Utils.AutoPatch(monkeypatch, MUT, 'Thread')
-    Utils.AutoPatch(monkeypatch, MUT.time, 'monotonic')
+    proc = context.Process.return_value
     MUT.time.monotonic.side_effect = [100, 102, 106]
     MUT.Event.return_value.wait.return_value = True
     MUT.Thread.return_value.start.side_effect = (
         lambda: MUT.Thread.call_args.kwargs['target']()
     )
-    MUT.wait.return_value = [context.Process.return_value.sentinel]
+    MUT.wait.return_value = [proc.sentinel]
     return (MUT.ModInVenv(worker.venvRoot, execTO=10), context)
 
 
@@ -343,12 +397,12 @@ def test_Call_SharesBudgetAcrossResponseAndExit(
     (worker, context) = boundedWorker
     proc = context.Process.return_value
     exitType = (
-        MUT.ExitType.EXCEPTION if isinstance(payload, BaseException)
+        MUT.ExitType.EXCEPTION if (isinstance(payload, BaseException))
         else MUT.ExitType.RETURN
     )
     context.Pipe.return_value[0].recv.return_value = (exitType, payload)
 
-    if isinstance(payload, BaseException):
+    if (isinstance(payload, BaseException)):
         with pytest.raises(type(payload)) as raised:
             worker.Call('target', 'Callable')
         assert (raised.value is payload)
@@ -398,7 +452,7 @@ def test_Call_TimeoutTerminatesAndReapsWorker(
     if (phase == 'startup'): MUT.Event.return_value.wait.assert_not_called()
     if (phase == 'response'): rcvPipe.recv.assert_not_called()
     assert (MUT.mp.set_executable.call_args_list == [
-        mock.call(str(worker.pyPath)), mock.call(b'/previous/python'),
+        mock.call('/unit/venv/bin/python'), mock.call(b'/previous/python'),
     ])
 
 
@@ -411,12 +465,12 @@ def test_Call_BoundedReceivePreservesExceptions(
 ) -> None:
     (worker, context) = boundedWorker
     context.Pipe.return_value[0].recv.side_effect = error
-    errorType = RuntimeError if isinstance(error, Exception) else type(error)
+    errorType = RuntimeError if (isinstance(error, Exception)) else type(error)
 
     with pytest.raises(errorType) as raised:
         worker.Call('target', 'Callable')
 
-    if isinstance(error, Exception): assert (raised.value.__cause__ is error)
+    if (isinstance(error, Exception)): assert (raised.value.__cause__ is error)
     else: assert (raised.value is error)
     MUT.wait.assert_not_called()
     context.Process.return_value.close.assert_called_once_with()
@@ -432,71 +486,29 @@ def test_Call_TargetExecutionTimeoutKeywordIsNotIntercepted(
     assert (context.Process.call_args.kwargs['args'][4] == {'execTO': 123})
 
 
-def test_Call_BlockedReceiveDoesNotBlockDeadline(
+def test_Call_BoundedReceiveTimeoutWhenReceiverDoesNotSignal(
     workerContext: tuple[MUT.ModInVenv, mock.MagicMock],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (worker, context) = workerContext
-    (entered, release) = (threading.Event(), threading.Event())
-    threads = []
-
-    def Thread(**kwargs: object) -> threading.Thread:
-        thread = threading.Thread(**kwargs)
-        threads.append(thread)
-        return thread
-
-    def Receive() -> None:
-        assert (threading.current_thread() is not threading.main_thread())
-        entered.set()
-        release.wait()
-        raise EOFError('worker terminated during receive')
-
-    def Wait(timeout: float) -> bool:
-        assert entered.wait(1)
-        return False
-
-    monkeypatch.setattr(MUT, 'Thread', Thread)
-    Utils.AutoPatch(monkeypatch, MUT, 'Event')
-    MUT.Event.return_value.wait.side_effect = Wait
-    context.Pipe.return_value[0].recv.side_effect = Receive
+    (rcvPipe, sndPipe) = context.Pipe.return_value
     proc = context.Process.return_value
+    MUT.time.monotonic.side_effect = [100, 102]
+    MUT.Event.return_value.wait.return_value = False
+    MUT.Thread.return_value.start.side_effect = None
     proc.is_alive.side_effect = [True, False, False]
-    proc.terminate.side_effect = release.set
-    try:
-        with pytest.raises(TimeoutError):
-            MUT.ModInVenv(worker.venvRoot, execTO=10).Call(
-                'target', 'Callable',
-            )
-    finally:
-        release.set()
-        for thread in threads: thread.join(1)
 
-    assert (len(threads) == 1)
-    assert not threads[0].is_alive()
+    with pytest.raises(TimeoutError):
+        MUT.ModInVenv(worker.venvRoot, execTO=10).Call(
+            'target', 'Callable',
+        )
+
+    MUT.Thread.assert_called_once()
+    assert (MUT.Thread.call_args.kwargs['daemon'] is True)
+    MUT.Thread.return_value.start.assert_called_once_with()
+    MUT.Event.return_value.wait.assert_called_once_with(8)
+    rcvPipe.recv.assert_not_called()
+    MUT.wait.assert_not_called()
     proc.terminate.assert_called_once_with()
     proc.close.assert_called_once_with()
-
-
-def test_Call_BoundedWorkerTimeoutInFreshInterpreter() -> None:
-    sourceRoot = Path(MUT.__file__).resolve().parents[2]
-    code = (
-        'from pathlib import Path\n'
-        'import multiprocessing as mp\n'
-        'import sys\n'
-        f'sys.path.insert(0, {str(sourceRoot)!r})\n'
-        'from libs.Utils.LibInVenv import ModInVenv\n'
-        'worker = ModInVenv(Path(sys.prefix), execTO=1)\n'
-        'try:\n'
-        '    worker.Call("time", "sleep", None, 60)\n'
-        'except TimeoutError:\n'
-        '    assert not mp.active_children()\n'
-        '    print("timed out and reaped")\n'
-        'else:\n'
-        '    raise AssertionError("missing worker deadline")\n'
-    )
-    result = subprocess.run(
-        [sys.executable, '-B', '-c', code],
-        capture_output=True, text=True, check=True, timeout=20,
-    )
-    assert (result.stdout == 'timed out and reaped\n')
-    assert (result.stderr == '')
+    rcvPipe.close.assert_called_once_with()
+    assert sndPipe.close.called

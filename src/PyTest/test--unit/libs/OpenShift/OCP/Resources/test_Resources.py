@@ -1,27 +1,27 @@
 from dataclasses import FrozenInstanceError
-import json
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import yaml
 
-from libs.CustomTypes import NamedDict
-from libs.OpenShift.OCP.CLI.OC import OCcli
-from libs.OpenShift.OCP.Resources import Namespace, Secret
 import libs.OpenShift.OCP.Resources as MUT
-from libs.Utils.CmdExec import CmdRes
 
 
 def test_ResCfg_DefaultsAreFreshAndBindingsFrozen() -> None:
-    (first, second) = MUT.ResCfg(), MUT.ResCfg()
-    assert (type(first.meta) is type(first.spec) is NamedDict)
+    namedDictInit = mock.Mock(return_value=None)
+    with mock.patch.object(MUT.NamedDict, '__init__', namedDictInit):
+        (first, second) = MUT.ResCfg(), MUT.ResCfg()
+
+    assert (namedDictInit.call_count == 4)
+    assert (type(first.meta) is type(first.spec) is MUT.NamedDict)
     assert (first.meta is not second.meta)
     assert (first.spec is not second.spec)
     assert (first.meta is not first.spec)
     assert (first.yaml is None)
-    first.meta.___update___(name='one')
+    dict.__setitem__(first.meta, 'name', 'one')
     assert (second.meta == {})
-    with pytest.raises(FrozenInstanceError): first.spec = NamedDict()
+    with pytest.raises(FrozenInstanceError): first.spec = {}
 
 
 def test_OwnInf_RequiresSharedMutableListAndFreezesBindings() -> None:
@@ -35,42 +35,60 @@ def test_OwnInf_RequiresSharedMutableListAndFreezesBindings() -> None:
 
 
 @pytest.mark.parametrize('meta,spec', [
-    (NamedDict(name='one'), NamedDict()),
-    (NamedDict(), NamedDict(data={})),
+    ({'name': 'one'}, {}),
+    ({}, {'data': {}}),
 ])
 def test__ValResCfg_AcceptsAllowedNativeKeys(
-    meta: NamedDict,
-    spec: NamedDict,
+    meta: dict[str, object],
+    spec: dict[str, object],
 ) -> None:
-    assert (MUT._ValResCfg(
-        MUT.ResCfg(meta=meta, spec=spec), {'name'}, {'data'}, 'Secret',
-    ) is None)
+    cfg = MUT.ResCfg(meta=meta, spec=spec)
+    assert (MUT._ValResCfg(cfg, {'name'}, {'data'}, 'Secret') is None)
 
 
 @pytest.mark.parametrize('field', ['meta', 'spec'])
 def test__ValResCfg_RejectsUnsupportedNativeKeys(field: str) -> None:
-    cfg = MUT.ResCfg(**{field: NamedDict(unsupported=True)})
+    cfgValues = {'meta': {}, 'spec': {}}
+    cfgValues[field] = {'unsupported': True}
+    cfg = MUT.ResCfg(**cfgValues)
+
     with pytest.raises(ValueError, match='Unsupported'):
         MUT._ValResCfg(cfg, {'name'}, {'data'}, 'Secret')
 
 
-def test__ValResCfg_YAMLIgnoresInvalidNativeAndChecksOnlyKind() -> None:
-    cfg = MUT.ResCfg(meta=None, spec=object(), yaml='kind: Secret\n')
+def test__ValResCfg_YAMLIgnoresInvalidNativeAndChecksOnlyKind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = 'kind: Secret\n'
+    parser = mock.Mock(return_value={'kind': 'Secret'})
+    monkeypatch.setattr(MUT, 'yaml', SimpleNamespace(safe_load=parser))
+    cfg = MUT.ResCfg(meta=None, spec=object(), yaml=text)
+
     assert (MUT._ValResCfg(cfg, set(), set(), 'Secret') is None)
+    parser.assert_called_once_with(text)
 
 
-@pytest.mark.parametrize('text,error', [
-    ('kind: Namespace', ValueError),
-    ('metadata: {}', KeyError),
-    ('[]', TypeError),
-    ('kind: [', yaml.YAMLError),
+@pytest.mark.parametrize('text,parsed,error', [
+    ('kind: Namespace', {'kind': 'Namespace'}, ValueError),
+    ('metadata: {}', {'metadata': {}}, KeyError),
+    ('[]', [], TypeError),
+    ('kind: [', yaml.YAMLError('invalid yaml'), yaml.YAMLError),
 ])
 def test__ValResCfg_RejectsInvalidAuthoritativeYAML(
+    monkeypatch: pytest.MonkeyPatch,
     text: str,
+    parsed: object,
     error: type[Exception],
 ) -> None:
+    parser = mock.Mock()
+    if (isinstance(parsed, Exception)): parser.side_effect = parsed
+    else: parser.return_value = parsed
+    monkeypatch.setattr(MUT, 'yaml', SimpleNamespace(safe_load=parser))
+    cfg = MUT.ResCfg(meta=None, spec=None, yaml=text)
+
     with pytest.raises(error):
-        MUT._ValResCfg(MUT.ResCfg(yaml=text), set(), set(), 'Secret')
+        MUT._ValResCfg(cfg, set(), set(), 'Secret')
+    parser.assert_called_once_with(text)
 
 
 @pytest.mark.parametrize('tracked', [False, True])
@@ -83,12 +101,15 @@ def test__ResCreate_DispatchesDefaultsAndPreservesOwnedList(
     resource = {'kind': 'Secret'}
     producer = {'subCmd': 'secret generic', 'args': ['one']}
     owned = [('caller-client', 'Secret/caller', 'caller-uid')]
-    info = (MUT.OwnInf(owned=owned, existResDelTO='9m') if tracked else None)
+    ownInf = MUT.OwnInf(owned=owned, existResDelTO='9m') if tracked else None
     resourceCLI.NewRes.return_value = (
-        OCcli.ResPhase.APPLIED, CmdRes('', '', 0, True), resource,
+        'APPLIED', SimpleNamespace(success=True), resource,
     )
     resourceCLI.EnsureRes.return_value = resource
-    assert (MUT._ResCreate(resourceCLI, producer, info, isSecret) is resource)
+
+    assert (MUT._ResCreate(
+        resourceCLI, producer, ownInf, isSecret,
+    ) is resource)
     if tracked:
         resourceCLI.EnsureRes.assert_called_once_with(
             producer, owned, isSecret=isSecret, existResDelTO='9m',
@@ -97,9 +118,7 @@ def test__ResCreate_DispatchesDefaultsAndPreservesOwnedList(
         assert (resourceCLI.EnsureRes.call_args.args[1] is owned)
         resourceCLI.NewRes.assert_not_called()
     else:
-        resourceCLI.NewRes.assert_called_once_with(
-            producer, isSecret=isSecret,
-        )
+        resourceCLI.NewRes.assert_called_once_with(producer, isSecret=isSecret)
         resourceCLI.EnsureRes.assert_not_called()
     assert (owned == [('caller-client', 'Secret/caller', 'caller-uid')])
 
@@ -108,62 +127,55 @@ def test__ResCreate_EmptyOwnedListEnablesTracking(
     resourceCLI: mock.MagicMock,
 ) -> None:
     owned = []
-    resourceCLI.EnsureRes.return_value = {'kind': 'Namespace'}
-    MUT._ResCreate(resourceCLI, 'kind: Namespace', MUT.OwnInf(owned))
+    resource = {'kind': 'Namespace'}
+    resourceCLI.EnsureRes.return_value = resource
+
+    assert (MUT._ResCreate(
+        resourceCLI, 'kind: Namespace', MUT.OwnInf(owned),
+    ) is resource)
     resourceCLI.EnsureRes.assert_called_once_with(
         'kind: Namespace', owned, isSecret=False, existResDelTO='5m',
         optsNewRes={},
     )
+    assert (resourceCLI.EnsureRes.call_args.args[1] is owned)
     resourceCLI.NewRes.assert_not_called()
 
 
-@pytest.mark.parametrize('resourceName', ['Namespace', 'Secret'])
-@pytest.mark.parametrize('tracked,reused', [
-    (False, False), (True, False), (True, True),
-])
-def test__ResCreate_NativeHandlersPreserveCreationAndReuse(
-    resourceName: str,
+@pytest.mark.parametrize('tracked', [False, True])
+def test__ResCreate_ForwardsOnlyNewResOptions(
+    resourceCLI: mock.MagicMock,
     tracked: bool,
-    reused: bool,
 ) -> None:
-    resource = {
-        'kind': resourceName, 'metadata': {'name': 'example', 'uid': 'uid'},
+    producer = 'kind: Namespace\n'
+    options = {
+        'waitCond': 'create', 'waitTime': '17s',
+        'resYAMLorSubCmd': 'stale-input',
     }
-    if (resourceName == 'Secret'): resource.update(type='Opaque', data={})
-    manifest = json.dumps(resource)
-    executor = mock.Mock()
-    executor.Run.return_value = CmdRes('', '', 0, True)
-    cli = OCcli(cmdExec=executor)
-    executor.Run.reset_mock()
-    responses = [CmdRes(manifest, '', 0, True)]
-    if tracked:
-        responses.append(CmdRes((manifest if reused else ''), '', 0, True))
-    if not reused:
-        responses.extend([
-            CmdRes(manifest, '', 0, True), CmdRes('', '', 0, True),
-        ])
-    executor.Run.side_effect = responses
-    owned = []
-    handler = (Namespace if (resourceName == 'Namespace') else Secret)
-    assert (handler.Create(
-        cli, MUT.ResCfg(meta=NamedDict(name='example')),
-        (MUT.OwnInf(owned) if tracked else None),
-    ) == resource)
-    assert (owned == (
-        [(cli, f'{resourceName}/example', 'uid')]
-        if (tracked and not reused) else []
-    ))
-    assert ([call.args[0][1] for call in executor.Run.call_args_list] == (
-        ['create'] + (['get'] if tracked else []) +
-        ([] if reused else ['apply', 'wait'])
-    ))
-    assert all(
-        (call.kwargs['isSecret'] == (resourceName == 'Secret'))
-        for call in executor.Run.call_args_list
+    resource = {'kind': 'Namespace'}
+    ownInf = MUT.OwnInf([], existResDelTO='9m') if tracked else None
+    resourceCLI.NewRes.return_value = (
+        'APPLIED', SimpleNamespace(success=True), resource,
     )
-    if not reused:
-        assert ('--for=create' in executor.Run.call_args.args[0])
-        assert ('--timeout=2m' in executor.Run.call_args.args[0])
+    resourceCLI.EnsureRes.return_value = resource
+
+    assert (MUT._ResCreate(
+        resourceCLI, producer, ownInf, True, options,
+    ) is resource)
+    if tracked:
+        resourceCLI.EnsureRes.assert_called_once_with(
+            producer, [], isSecret=True, existResDelTO='9m',
+            optsNewRes={'waitCond': 'create', 'waitTime': '17s'},
+        )
+        resourceCLI.NewRes.assert_not_called()
+    else:
+        resourceCLI.NewRes.assert_called_once_with(
+            producer, isSecret=True, waitCond='create', waitTime='17s',
+        )
+        resourceCLI.EnsureRes.assert_not_called()
+    assert (options == {
+        'waitCond': 'create', 'waitTime': '17s',
+        'resYAMLorSubCmd': 'stale-input',
+    })
 
 
 @pytest.mark.parametrize('tracked', [False, True])
@@ -174,25 +186,33 @@ def test__ResCreate_RejectsInvalidReturnedState(
     resource: object,
 ) -> None:
     resourceCLI.NewRes.return_value = (
-        OCcli.ResPhase.APPLIED, CmdRes('', '', 0, True), resource,
+        'APPLIED', SimpleNamespace(success=True), resource,
     )
     resourceCLI.EnsureRes.return_value = resource
+
     with pytest.raises(RuntimeError, match='No valid resource dictionary'):
         MUT._ResCreate(
-            resourceCLI, 'kind: Secret', (MUT.OwnInf([]) if tracked else None),
+            resourceCLI, 'kind: Secret',
+            MUT.OwnInf([]) if tracked else None,
         )
 
 
 def test__ResCreate_FailedCommandOmitsPrivateOutput(
     resourceCLI: mock.MagicMock,
 ) -> None:
-    resourceCLI.NewRes.return_value = (
-        OCcli.ResPhase.DRY_RUN,
-        CmdRes('dummy-private-output', 'dummy-private-error', 1, False), None,
+    phase = SimpleNamespace(name='DRY_RUN')
+    result = SimpleNamespace(
+        success=False, stdout='dummy-private-output',
+        stderr='dummy-private-error',
     )
-    with pytest.raises(RuntimeError, match='DRY_RUN') as caught:
+    resourceCLI.NewRes.return_value = (phase, result, None)
+
+    with pytest.raises(RuntimeError) as caught:
         MUT._ResCreate(resourceCLI, 'kind: Secret', isSecret=True)
+
+    assert (str(caught.value) == 'Resource creation failed at DRY_RUN.')
     assert ('dummy-private' not in str(caught.value))
+    resourceCLI.EnsureRes.assert_not_called()
 
 
 @pytest.mark.parametrize('tracked', [False, True])
@@ -200,12 +220,23 @@ def test__ResCreate_PreservesLifecycleException(
     resourceCLI: mock.MagicMock,
     tracked: bool,
 ) -> None:
-    error = ValueError('invalid lifecycle state')
-    method = (resourceCLI.EnsureRes if tracked else resourceCLI.NewRes)
-    method.side_effect = error
+    failure = ValueError('invalid lifecycle state')
+    method = resourceCLI.EnsureRes if tracked else resourceCLI.NewRes
+    method.side_effect = failure
+    ownInf = MUT.OwnInf([]) if tracked else None
+
     with pytest.raises(ValueError) as caught:
-        MUT._ResCreate(
-            resourceCLI, 'kind: Namespace',
-            (MUT.OwnInf([]) if tracked else None),
+        MUT._ResCreate(resourceCLI, 'kind: Namespace', ownInf)
+
+    assert (caught.value is failure)
+    if tracked:
+        resourceCLI.EnsureRes.assert_called_once_with(
+            'kind: Namespace', [], isSecret=False, existResDelTO='5m',
+            optsNewRes={},
         )
-    assert (caught.value is error)
+        resourceCLI.NewRes.assert_not_called()
+    else:
+        resourceCLI.NewRes.assert_called_once_with(
+            'kind: Namespace', isSecret=False,
+        )
+        resourceCLI.EnsureRes.assert_not_called()

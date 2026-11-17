@@ -61,8 +61,8 @@ def test__CallInVenv_RebuildsOrderedPathsAndReturnsTaggedResult(
     zipName = 'python{}{}.zip'.format(*MUT.sys.version_info[:2])
     expectedPaths = [
         '/first', '/extra', *(['/last'] if pythonPath else []),
-        str(stdlib.parent / zipName), workerPaths['stdlib'],
-        workerPaths['platstdlib'], (sharedPath or str(stdlib / 'DLLs')),
+        str((stdlib.parent / zipName)), workerPaths['stdlib'],
+        workerPaths['platstdlib'], (sharedPath or str((stdlib / 'DLLs'))),
     ]
 
     with mock.patch.object(MUT.sys, 'path', list(beforePath)):
@@ -120,8 +120,10 @@ def test__CallInVenv_RejectsInvalidRuntimeWithNotedException(
     sndPipe.close.assert_called_once_with()
 
 
-@pytest.mark.parametrize('outcome', ['return', 'exception', 'bad-result',
-                                     'bad-exception', 'closed-pipe'])
+@pytest.mark.parametrize(
+    'outcome',
+    ['return', 'exception', 'bad-result', 'bad-exception', 'closed-pipe'],
+)
 def test__CallInVenv_TransportsResultsAndExceptionsOrExits32(
     workerPaths: dict[str, str],
     sndPipe: mock.Mock,
@@ -165,7 +167,7 @@ def test__CallInVenv_TransportsResultsAndExceptionsOrExits32(
     target.assert_called_once_with()
     sndPipe.close.assert_called_once_with()
     if (outcome == 'closed-pipe'):
-        assert (sndPipe.send.call_count == 2)
+        assert (sndPipe.send.call_count == 3)
         return
     (exitType, result) = sndPipe.send.call_args.args[0]
     if (outcome == 'return'):

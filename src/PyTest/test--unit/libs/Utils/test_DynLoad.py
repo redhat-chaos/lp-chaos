@@ -1,11 +1,3 @@
-from collections.abc import Iterator
-from importlib.machinery import ModuleSpec, SourceFileLoader
-import json
-import os
-from pathlib import Path
-import signal
-import subprocess
-import sys
 from unittest import mock
 
 import pytest
@@ -13,10 +5,56 @@ import pytest
 import libs.Utils.DynLoad as MUT
 
 
-@pytest.fixture(autouse=True)
-def ModuleRegistry() -> Iterator[None]:
-    with mock.patch.dict(sys.modules):
-        yield
+@pytest.fixture(autouse=True, name='moduleState')
+def ModuleState(monkeypatch: pytest.MonkeyPatch) -> mock.MagicMock:
+    sysState = mock.MagicMock()
+    sysState.modules = {}
+    sysState.path = ['/synthetic/import-path']
+    sysState.argv = ['original-script', 'original-argument']
+    monkeypatch.setattr(MUT, 'sys', sysState)
+    return sysState
+
+
+def PreparePath(
+    monkeypatch: pytest.MonkeyPatch,
+    pathParts: tuple[str, ...],
+    nameParts: tuple[str, ...] | None = None,
+    fileExists: bool = True,
+    suffix: str = '.py',
+    pathText: str = '/synthetic/target',
+) -> tuple[mock.Mock, ...]:
+    path = mock.MagicMock()
+    path.resolve.return_value = path
+    path.is_file.return_value = fileExists
+    path.parts = pathParts
+    path.suffix = suffix
+    path.__str__.return_value = pathText
+    namePath = mock.MagicMock()
+    namePath.parts = pathParts if (nameParts is None) else nameParts
+    path.with_suffix.return_value = namePath
+    pathFactory = mock.Mock(return_value=path)
+    monkeypatch.setattr(MUT, 'Path', pathFactory)
+    return (pathFactory, path, namePath)
+
+
+def PrepareImport(
+    monkeypatch: pytest.MonkeyPatch,
+    pathParts: tuple[str, ...],
+    nameParts: tuple[str, ...] | None = None,
+    fileExists: bool = True,
+    suffix: str = '.py',
+) -> tuple[mock.Mock, ...]:
+    (pathFactory, path, namePath) = PreparePath(
+        monkeypatch, pathParts, nameParts, fileExists, suffix,
+    )
+    importer = mock.Mock()
+    spec = mock.MagicMock()
+    spec.loader = mock.MagicMock()
+    module = mock.MagicMock()
+    importer.util.spec_from_file_location = mock.Mock(return_value=spec)
+    importer.util.module_from_spec = mock.Mock(return_value=module)
+    monkeypatch.setattr(MUT, 'importlib', importer)
+    return (pathFactory, path, namePath, importer, spec, module)
 
 
 @pytest.mark.parametrize('filename,expected', [
@@ -35,257 +73,371 @@ def ModuleRegistry() -> Iterator[None]:
 ])
 def test_ImportFromPath_UsesExactAbsoluteRunEncoding(
     monkeypatch: pytest.MonkeyPatch,
+    moduleState: mock.MagicMock,
     filename: str,
     expected: str,
 ) -> None:
-    path = Path('/foo/bar') / filename
-    monkeypatch.setattr(Path, 'resolve', lambda self: path)
-    monkeypatch.setattr(Path, 'is_file', lambda self: True)
-    specFactory = MUT.importlib.util.spec_from_file_location
+    suffix = '.py' if filename.endswith('.py') else '.txt'
+    pathParts = ('/', 'foo', 'bar', filename)
+    nameParts = (
+        (pathParts[:-1] + (filename[:-3],))
+        if (suffix == '.py') else pathParts
+    )
+    (pathFactory, path, namePath, importer, spec, module) = PrepareImport(
+        monkeypatch, pathParts, nameParts, suffix=suffix,
+    )
+    moduleName = f'foo.bar.{expected}'
+    module.__name__ = moduleName
+    beforePath = list(moduleState.path)
 
-    def CreateSpec(name: str, location: Path) -> ModuleSpec:
-        spec = specFactory(
-            name, location, loader=SourceFileLoader(name, str(location)),
-        )
-        spec.loader.exec_module = mock.Mock()
-        return spec
+    result = MUT.ImportFromPath('relative.py')
 
-    monkeypatch.setattr(MUT.importlib.util, 'spec_from_file_location',
-                        CreateSpec)
-    module = MUT.ImportFromPath('relative.py')
-    assert (module.__name__ == f'foo.bar.{expected}')
-    assert (module.__spec__.name == module.__name__)
-    assert (sys.modules[module.__name__] is module)
+    assert (result is module)
+    assert (module.__name__ == moduleName)
+    assert (moduleState.modules[moduleName] is module)
+    assert (moduleState.path == beforePath)
+    pathFactory.assert_called_once_with('relative.py')
+    path.resolve.assert_called_once_with()
+    path.is_file.assert_called_once_with()
+    if (suffix == '.py'): path.with_suffix.assert_called_once_with('')
+    else: path.with_suffix.assert_not_called()
+    importer.util.spec_from_file_location.assert_called_once_with(
+        moduleName, path,
+    )
+    importer.util.module_from_spec.assert_called_once_with(spec)
+    spec.loader.exec_module.assert_called_once_with(module)
+    assert (namePath.parts == nameParts)
 
 
 def test_ImportFromPath_RegistersBeforeExecutionAndReturnsModule(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    moduleState: mock.MagicMock,
 ) -> None:
-    path = tmp_path / 'registered.py'
-    path.write_text(
-        'import sys\n'
-        'registered = sys.modules[__name__]\n'
-        'value = 42\n'
+    moduleName = 'synthetic.registered'
+    (pathFactory, path, namePath, importer, spec, module) = PrepareImport(
+        monkeypatch,
+        ('/', 'synthetic', 'registered.py'),
+        ('/', 'synthetic', 'registered'),
     )
-    module = MUT.ImportFromPath(path)
-    assert (module.registered is module)
-    assert (module.value == 42)
-    assert (module.__spec__.name == module.__name__)
-    assert (sys.modules[module.__name__] is module)
-    assert (not module.__name__.startswith('.'))
-    assert (module.__file__ == str(path.resolve()))
+    module.__name__ = moduleName
+
+    def CheckRegistration(loadedModule: mock.MagicMock) -> None:
+        assert (moduleState.modules[moduleName] is loadedModule)
+
+    spec.loader.exec_module.side_effect = CheckRegistration
+    result = MUT.ImportFromPath('registered.py')
+
+    assert (result is module)
+    assert (moduleState.modules[moduleName] is module)
+    pathFactory.assert_called_once_with('registered.py')
+    importer.util.module_from_spec.assert_called_once_with(spec)
+    spec.loader.exec_module.assert_called_once_with(module)
+    assert (namePath.parts == ('/', 'synthetic', 'registered'))
 
 
 def test_ImportFromPath_DistinguishesDirectoriesAndEscapeLookalikes(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    moduleState: mock.MagicMock,
 ) -> None:
-    modules = []
-    for directory in ('-', '_h_', '--', '_hh_', '_._', '_udu_'):
-        folder = tmp_path / directory
-        folder.mkdir()
-        path = folder / 'prep.py'
-        path.write_text(f'value = {directory!r}\n')
-        module = MUT.ImportFromPath(path)
-        assert (module.value == directory)
-        assert (sys.modules[module.__name__] is module)
-        modules.append(module)
-    assert (len({module.__name__ for module in modules}) == 6)
+    encodedNames = []
+    for (directory, encoded) in [
+        ('-', '_h_'), ('_h_', '_u_h_u_'), ('--', '_hh_'),
+        ('_hh_', '_u_hh_u_'), ('_._', '_udu_'), ('_udu_', '_u_udu_u_'),
+    ]:
+        (pathFactory, path, namePath, importer, spec, module) = PrepareImport(
+            monkeypatch,
+            ('/', directory, 'prep.py'),
+            ('/', directory, 'prep'),
+        )
+        moduleName = f'{encoded}.prep'
+        module.__name__ = moduleName
+        result = MUT.ImportFromPath('synthetic/path')
+        assert (result is module)
+        assert (moduleState.modules[moduleName] is module)
+        pathFactory.assert_called_once_with('synthetic/path')
+        importer.util.module_from_spec.assert_called_once_with(spec)
+        spec.loader.exec_module.assert_called_once_with(module)
+        assert (namePath.parts == ('/', directory, 'prep'))
+        encodedNames.append(moduleName)
+    assert (len(set(encodedNames)) == 6)
 
 
-def test_ImportFromPath_ResolvedAliasesReloadWithoutCreatingParents(
-    tmp_path: Path,
+def test_ImportFromPath_ResolvedAliasesReloadFreshModulesWithoutParents(
+    monkeypatch: pytest.MonkeyPatch,
+    moduleState: mock.MagicMock,
 ) -> None:
-    path = tmp_path / 'fresh.py'
-    path.write_text('value = object()\n')
-    alias = tmp_path / 'alias.py'
-    alias.symlink_to(path)
-    beforePath = list(sys.path)
-    first = MUT.ImportFromPath(str(path))
-    second = MUT.ImportFromPath(alias)
-    assert (first.__name__ == second.__name__)
+    (pathFactory, path, namePath, importer, firstSpec, first) = PrepareImport(
+        monkeypatch,
+        ('/', 'synthetic', 'fresh.py'),
+        ('/', 'synthetic', 'fresh'),
+    )
+    originalPath = mock.MagicMock()
+    aliasPath = mock.MagicMock()
+    originalPath.resolve.return_value = path
+    aliasPath.resolve.return_value = path
+    pathFactory.side_effect = [originalPath, aliasPath]
+    secondSpec = mock.MagicMock()
+    secondSpec.loader = mock.MagicMock()
+    second = mock.MagicMock()
+    moduleName = 'synthetic.fresh'
+    first.__name__ = moduleName
+    second.__name__ = moduleName
+    importer.util.spec_from_file_location.side_effect = [firstSpec, secondSpec]
+    importer.util.module_from_spec.side_effect = [first, second]
+    beforePath = list(moduleState.path)
+
+    firstResult = MUT.ImportFromPath('original.py')
+    secondResult = MUT.ImportFromPath('alias.py')
+
+    assert (firstResult is first)
+    assert (secondResult is second)
     assert (first is not second)
-    assert (first.value is not second.value)
-    assert (sys.modules[first.__name__] is second)
-    assert (sys.path == beforePath)
-    parent = first.__name__.rsplit('.', 1)[0]
-    assert (parent not in sys.modules)
+    assert (first.__name__ == second.__name__)
+    assert (moduleState.modules[moduleName] is second)
+    assert ('synthetic' not in moduleState.modules)
+    assert (moduleState.path == beforePath)
+    assert (pathFactory.call_args_list == [
+        mock.call('original.py'), mock.call('alias.py'),
+    ])
+    assert (originalPath.resolve.call_count == 1)
+    assert (aliasPath.resolve.call_count == 1)
+    assert (path.is_file.call_count == 2)
+    assert (firstSpec.loader.exec_module.call_args_list == [mock.call(first)])
+    assert (
+        secondSpec.loader.exec_module.call_args_list == [mock.call(second)]
+    )
+    assert (namePath.parts == ('/', 'synthetic', 'fresh'))
 
 
 @pytest.mark.parametrize('previousKind', ['missing', 'none', 'module'])
-@pytest.mark.parametrize('errorType', [RuntimeError, SystemExit,
-                                       KeyboardInterrupt])
+@pytest.mark.parametrize(
+    'errorType', [RuntimeError, SystemExit, KeyboardInterrupt],
+)
 def test_ImportFromPath_RestoresRegistryOnBaseException(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    moduleState: mock.MagicMock,
     previousKind: str,
     errorType: type[BaseException],
 ) -> None:
-    path = tmp_path / 'rollback.py'
-    path.write_text('value = 1\n')
-    initial = MUT.ImportFromPath(path)
-    name = initial.__name__
-    if (previousKind == 'missing'): del sys.modules[name]
-    elif (previousKind == 'none'): sys.modules[name] = None
+    moduleName = 'synthetic.rollback'
+    (_, _, _, _, spec, _) = PrepareImport(
+        monkeypatch,
+        ('/', 'synthetic', 'rollback.py'),
+        ('/', 'synthetic', 'rollback'),
+    )
+    previous = mock.sentinel.previousModule
+    if (previousKind == 'none'): moduleState.modules[moduleName] = None
+    elif (previousKind == 'module'): moduleState.modules[moduleName] = previous
     error = errorType('synthetic failure')
-    monkeypatch.setattr(sys, '_dynload_test_error', error, raising=False)
-    path.write_text('import sys\nraise sys._dynload_test_error\n')
+    spec.loader.exec_module.side_effect = error
+
     with pytest.raises(errorType) as caught:
-        MUT.ImportFromPath(path)
+        MUT.ImportFromPath('rollback.py')
+
     assert (caught.value is error)
-    if (previousKind == 'missing'): assert (name not in sys.modules)
-    elif (previousKind == 'none'): assert (sys.modules[name] is None)
-    else: assert (sys.modules[name] is initial)
+    if (previousKind == 'missing'):
+        assert (moduleName not in moduleState.modules)
+    elif (previousKind == 'none'):
+        assert (moduleState.modules[moduleName] is None)
+    else: assert (moduleState.modules[moduleName] is previous)
 
 
-def test_ImportFromPath_RejectsMissingFile(tmp_path: Path) -> None:
+def test_ImportFromPath_RejectsMissingFile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (pathFactory, path, _, importer, _, _) = PrepareImport(
+        monkeypatch,
+        ('/', 'synthetic', 'absent.py'),
+        ('/', 'synthetic', 'absent'),
+        fileExists=False,
+    )
+
     with pytest.raises(FileNotFoundError, match='Target module'):
-        MUT.ImportFromPath(tmp_path / 'absent.py')
+        MUT.ImportFromPath('absent.py')
+
+    pathFactory.assert_called_once_with('absent.py')
+    path.is_file.assert_called_once_with()
+    importer.util.spec_from_file_location.assert_not_called()
 
 
-def test_ImportFromPath_RejectsUnsupportedExtension(tmp_path: Path) -> None:
-    path = tmp_path / 'present.txt'
-    path.write_text('')
+def test_ImportFromPath_RejectsUnsupportedExtension(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (pathFactory, path, _, importer, _, _) = PrepareImport(
+        monkeypatch,
+        ('/', 'synthetic', 'present.txt'),
+        fileExists=True,
+        suffix='.txt',
+    )
+    importer.util.spec_from_file_location.return_value = mock.Mock(
+        loader=None,
+    )
+
     with pytest.raises(ImportError, match='Could not build module spec'):
-        MUT.ImportFromPath(path)
+        MUT.ImportFromPath('present.txt')
+
+    pathFactory.assert_called_once_with('present.txt')
+    path.is_file.assert_called_once_with()
+    path.with_suffix.assert_not_called()
+    importer.util.module_from_spec.assert_not_called()
 
 
 @pytest.mark.parametrize('noSpec', [True, False])
 def test_ImportFromPath_RejectsMissingSpecOrLoader(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     noSpec: bool,
 ) -> None:
-    path = tmp_path / 'present.py'
-    path.write_text('')
-    monkeypatch.setattr(
-        MUT.importlib.util, 'spec_from_file_location',
-        lambda *args: None if noSpec else mock.Mock(loader=None),
+    (_, _, _, importer, _, _) = PrepareImport(
+        monkeypatch,
+        ('/', 'synthetic', 'present.py'),
+        ('/', 'synthetic', 'present'),
     )
+    if noSpec: importer.util.spec_from_file_location.return_value = None
+    else:
+        spec = mock.Mock()
+        spec.loader = None
+        importer.util.spec_from_file_location.return_value = spec
+
     with pytest.raises(ImportError, match='Could not build module spec'):
-        MUT.ImportFromPath(path)
+        MUT.ImportFromPath('present.py')
+
+    importer.util.spec_from_file_location.assert_called_once()
+    importer.util.module_from_spec.assert_not_called()
 
 
-def test_ImportFromPath_AnnotatedDataclassArgumentsThroughRunFromPath(
-    tmp_path: Path,
+def test_RunFromPath_PassesArgumentsAndRestoresArgv(
+    monkeypatch: pytest.MonkeyPatch,
+    moduleState: mock.MagicMock,
 ) -> None:
-    root = Path(__file__).resolve().parents[4]
-    (tmp_path / 'env.sh').write_text(
-        'read -r value || :\n'
-        'export SYNTHETIC_VALUE=sourced\n'
-        'unset SYNTHETIC_REMOVE\n'
-        'printf "synthetic output\\n"\n'
+    (pathFactory, path, _) = PreparePath(
+        monkeypatch,
+        ('/', 'synthetic', 'entry.py'),
+        pathText='/synthetic/entry.py',
     )
-    (tmp_path / 'prep.py').write_text(
-        'from __future__ import annotations\n'
-        'from dataclasses import dataclass\n'
-        'import os, sys\n'
-        '@dataclass\n'
-        'class Config:\n'
-        '    value: str\n'
-        'def BuildArgs():\n'
-        '    assert sys.modules[__name__].Config is Config\n'
-        '    return [Config(os.environ["SYNTHETIC_VALUE"]).value]\n'
+    tempEnv = mock.MagicMock()
+    tempEnvFactory = mock.Mock(return_value=tempEnv)
+    updateEnv = mock.Mock()
+    runpy = mock.Mock()
+    result = {'observed': 'synthetic'}
+    observed = {}
+
+    def CaptureRunPath(
+        scriptPath: str,
+        init_globals: dict,
+        run_name: str,
+    ) -> dict:
+        observed['argv'] = list(moduleState.argv)
+        return result
+
+    runpy.run_path.side_effect = CaptureRunPath
+    monkeypatch.setattr(MUT, 'TempEnv', tempEnvFactory)
+    monkeypatch.setattr(MUT, 'UpdEnv', updateEnv)
+    monkeypatch.setattr(MUT, 'runpy', runpy)
+    envVars = {'UNIT_DYN_REMOVE': None, 'UNIT_DYN_VALUE': 7}
+    initGlobals = {'injected': 'safe-global'}
+    beforeArgs = moduleState.argv
+
+    runResult = MUT.RunFromPath(
+        'entry.py', [42, 'tail'], envVars, initGlobals,
     )
-    (tmp_path / 'entry.py').write_text(
-        'import os, sys\n'
-        'observed = [sys.argv[1:], os.getenv("SYNTHETIC_VALUE"),\n'
-        '            os.getenv("SYNTHETIC_REMOVE")]\n'
+
+    assert (runResult is result)
+    assert (observed['argv'] == ['/synthetic/entry.py', '42', 'tail'])
+    assert (moduleState.argv is beforeArgs)
+    pathFactory.assert_called_once_with('entry.py')
+    path.resolve.assert_called_once_with()
+    path.is_file.assert_called_once_with()
+    tempEnvFactory.assert_called_once_with()
+    tempEnv.__enter__.assert_called_once_with()
+    tempEnv.__exit__.assert_called_once()
+    updateEnv.assert_called_once_with(envVars)
+    runpy.run_path.assert_called_once_with(
+        '/synthetic/entry.py', init_globals=initGlobals,
+        run_name='__main__',
     )
-    code = (
-        'import json, os, sys\n'
-        f'sys.path.insert(0, {str(root)!r})\n'
-        'from libs.Utils.DynLoad import ImportFromPath, RunFromPath\n'
-        'from libs.Utils.ShellSourceEnv import DoShellSource\n'
-        f'DoShellSource(envFiles=[{str(tmp_path / "env.sh")!r}])\n'
-        f'prep = ImportFromPath({str(tmp_path / "prep.py")!r})\n'
-        'sourced = dict(os.environ)\n'
-        f'result = RunFromPath({str(tmp_path / "entry.py")!r}, '
-        'prep.BuildArgs(), {"KUBECONFIG": "synthetic-config"})\n'
-        'assert dict(os.environ) == sourced\n'
-        'print(json.dumps(result["observed"]))\n'
-    )
-    process = subprocess.Popen(
-        [sys.executable, '-c', code], stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, start_new_session=True,
-        env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
-             'HOME': str(tmp_path), 'SYNTHETIC_REMOVE': 'safe'},
-    )
-    try:
-        (stdout, stderr) = process.communicate(timeout=5)
-    finally:
-        try: os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError: pass
-        process.wait(timeout=5)
-    assert (process.returncode == 0), stderr
-    assert (json.loads(stdout) == [['sourced'], 'sourced', None])
-    assert (stderr == 'synthetic output\n')
 
 
-def test_RunFromPath_PreservesEnvironmentAndArguments(tmp_path: Path) -> None:
-    path = tmp_path / 'entry.py'
-    path.write_text(
-        'import os, sys\n'
-        'observed = (os.getenv("SYNTHETIC_REMOVE"),\n'
-        '            os.getenv("SYNTHETIC_VALUE"), sys.argv[:], injected)\n'
+def test_RunFromPath_RejectsMissingFile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (pathFactory, path, _) = PreparePath(
+        monkeypatch,
+        ('/', 'synthetic', 'absent.py'),
+        fileExists=False,
+        pathText='/synthetic/absent.py',
     )
-    beforeArgs = sys.argv
-    with mock.patch.dict(os.environ, {'SYNTHETIC_REMOVE': 'before'}):
-        beforeEnv = dict(os.environ)
-        result = MUT.RunFromPath(
-            path, [42], {'SYNTHETIC_REMOVE': None, 'SYNTHETIC_VALUE': 7},
-            {'injected': 'safe-global'},
-        )
-        assert (result['observed'] == (
-            None, '7', [str(path), '42'], 'safe-global',
-        ))
-        assert (dict(os.environ) == beforeEnv)
-    assert (sys.argv is beforeArgs)
+    tempEnvFactory = mock.Mock()
+    updateEnv = mock.Mock()
+    runpy = mock.Mock()
+    monkeypatch.setattr(MUT, 'TempEnv', tempEnvFactory)
+    monkeypatch.setattr(MUT, 'UpdEnv', updateEnv)
+    monkeypatch.setattr(MUT, 'runpy', runpy)
 
-
-def test_RunFromPath_RejectsMissingFile(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match='Target script'):
-        MUT.RunFromPath(tmp_path / 'absent.py')
+        MUT.RunFromPath('absent.py')
+
+    pathFactory.assert_called_once_with('absent.py')
+    path.is_file.assert_called_once_with()
+    tempEnvFactory.assert_not_called()
+    updateEnv.assert_not_called()
+    runpy.run_path.assert_not_called()
 
 
-def test_UpdEnv_EmptyUpdatesLeaveEnvironmentUnchanged() -> None:
-    beforeEnv = dict(os.environ)
+def test_UpdEnv_EmptyUpdatesLeaveEnvironmentUnchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = {'UNIT_UPD_EXISTING': 'original'}
+    monkeypatch.setattr(MUT, 'os', mock.Mock(environ=environment))
+    beforeEnv = dict(environment)
+
     assert (MUT.UpdEnv({}) is None)
-    assert (dict(os.environ) == beforeEnv)
+    assert (environment == beforeEnv)
 
 
 def test_UpdEnv_DeletesNoneAndCoercesOtherValues(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv('UNIT_UPD_DELETE', 'old')
-    monkeypatch.delenv('UNIT_UPD_MISSING', raising=False)
-    monkeypatch.setenv('UNIT_UPD_EMPTY', 'old')
-    beforeEnv = dict(os.environ)
+    environment = {'UNIT_UPD_DELETE': 'old', 'UNIT_UPD_EMPTY': 'old'}
+    monkeypatch.setattr(MUT, 'os', mock.Mock(environ=environment))
+    beforeEnv = dict(environment)
     envUpd = {
         'UNIT_UPD_DELETE': None, 'UNIT_UPD_MISSING': None,
         'UNIT_UPD_EMPTY': '', 'UNIT_UPD_NUMBER': 42,
         'UNIT_UPD_BOOL': False, 'UNIT_UPD_LITERAL': 'None',
     }
     original = dict(envUpd)
-    with MUT.TempEnv():
-        assert (MUT.UpdEnv(envUpd) is None)
-        assert ('UNIT_UPD_DELETE' not in os.environ)
-        assert ('UNIT_UPD_MISSING' not in os.environ)
-        assert (os.environ['UNIT_UPD_EMPTY'] == '')
-        assert (os.environ['UNIT_UPD_NUMBER'] == '42')
-        assert (os.environ['UNIT_UPD_BOOL'] == 'False')
-        assert (os.environ['UNIT_UPD_LITERAL'] == 'None')
+
+    assert (MUT.UpdEnv(envUpd) is None)
+
+    assert ('UNIT_UPD_DELETE' not in environment)
+    assert ('UNIT_UPD_MISSING' not in environment)
+    assert (environment['UNIT_UPD_EMPTY'] == '')
+    assert (environment['UNIT_UPD_NUMBER'] == '42')
+    assert (environment['UNIT_UPD_BOOL'] == 'False')
+    assert (environment['UNIT_UPD_LITERAL'] == 'None')
     assert (envUpd == original)
-    assert (dict(os.environ) == beforeEnv)
+    expectedEnv = dict(beforeEnv)
+    expectedEnv.pop('UNIT_UPD_DELETE')
+    expectedEnv.update({
+        'UNIT_UPD_EMPTY': '', 'UNIT_UPD_NUMBER': '42',
+        'UNIT_UPD_BOOL': 'False', 'UNIT_UPD_LITERAL': 'None',
+    })
+    assert (environment == expectedEnv)
 
 
-def test_UpdEnv_PreservesConversionErrorAndEarlierUpdates() -> None:
+def test_UpdEnv_PreservesConversionErrorAndEarlierUpdates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = {'UNIT_UPD_EXISTING': 'original'}
+    monkeypatch.setattr(MUT, 'os', mock.Mock(environ=environment))
     error = ValueError('synthetic conversion failure')
     value = mock.MagicMock()
     value.__str__.side_effect = error
-    beforeEnv = dict(os.environ)
-    with MUT.TempEnv():
-        with pytest.raises(ValueError) as raised:
-            MUT.UpdEnv({'UNIT_UPD_FIRST': 'temporary', 'UNIT_UPD_BAD': value})
-        assert (raised.value is error)
-        assert (os.environ['UNIT_UPD_FIRST'] == 'temporary')
-    assert (dict(os.environ) == beforeEnv)
+
+    with pytest.raises(ValueError) as raised:
+        MUT.UpdEnv({'UNIT_UPD_FIRST': 'temporary', 'UNIT_UPD_BAD': value})
+
+    assert (raised.value is error)
+    assert (environment['UNIT_UPD_FIRST'] == 'temporary')
+    assert (environment['UNIT_UPD_EXISTING'] == 'original')
+    assert ('UNIT_UPD_BAD' not in environment)

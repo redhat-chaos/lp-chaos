@@ -1,14 +1,19 @@
 import inspect
-import os
 import subprocess
-import sys
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 import libs.Utils.CmdExec as MUT
-import Utils
+
+
+def Completed(
+    returnCode: int,
+    stdout: str | bytes = '',
+    stderr: str | bytes = '',
+) -> SimpleNamespace:
+    return SimpleNamespace(returncode=returnCode, stdout=stdout, stderr=stderr)
 
 
 @pytest.mark.parametrize('output', ['text', b'bytes', None])
@@ -21,22 +26,19 @@ def test_Run_UncapturedStderrRetries_ReviewRegression(
         for code in (7, 0)
     ]
     run = mock.Mock(side_effect=results)
+    sleep = mock.Mock()
     monkeypatch.setattr(MUT.subprocess, 'run', run)
-    monkeypatch.setattr(MUT.time, 'sleep', mock.Mock())
-    spPars = {
-        'capture_output': False, 'text': not isinstance(output, bytes),
-    }
+    monkeypatch.setattr(MUT, 'time', SimpleNamespace(sleep=sleep))
+    spPars = {'capture_output': False, 'text': not isinstance(output, bytes)}
     if (output is not None): spPars['stdout'] = subprocess.PIPE
-    result = MUT.CmdExec().Run(
-        ['synthetic'], tryMax=2, spPars=spPars,
-    )
+    result = MUT.CmdExec().Run(['synthetic'], tryMax=2, spPars=spPars)
     assert result.success
     assert (result.stdout is output)
     assert (result.stderr is None)
     assert (run.call_count == 2)
-    assert (run.call_args_list == [
-        mock.call(['synthetic'], input=None, shell=False, **spPars),
-    ] * 2)
+    expectedCall = mock.call(['synthetic'], input=None, shell=False, **spPars)
+    assert (run.call_args_list == ([expectedCall] * 2))
+    sleep.assert_called_once_with(5)
 
 
 @pytest.mark.parametrize('warnOnFail', [None, True, False])
@@ -49,30 +51,30 @@ def test_Run_WarnOnFailChangesOnlyNonzeroWarnings(
     isSecret: bool,
     exitCodes: tuple[int, ...],
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT.subprocess, 'run')
-    Utils.AutoPatch(monkeypatch, MUT.time, 'sleep')
-    MUT.subprocess.run.side_effect = [
+    run = mock.Mock(side_effect=[
         Completed(code, 'synthetic-output', 'synthetic-error')
         for code in exitCodes
-    ]
+    ])
+    sleep = mock.Mock()
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
+    monkeypatch.setattr(MUT, 'time', SimpleNamespace(sleep=sleep))
     options = {} if (warnOnFail is None) else {'warnOnFail': warnOnFail}
     with caplog.at_level('INFO'):
         result = MUT.CmdExec(defTryMax=4, tryWait=3).Run(
             ['synthetic-command'], False, 'synthetic-input', isSecret,
-            tryMax=len(exitCodes), spPars={'timeout': 2}, **options,
+            **options, tryMax=len(exitCodes), spPars={'timeout': 2},
         )
 
     assert (result == MUT.CmdRes(
         'synthetic-output', 'synthetic-error', exitCodes[-1],
         (exitCodes[-1] == 0),
     ))
-    assert (MUT.subprocess.run.call_args_list == ([mock.call(
+    expectedCall = mock.call(
         ['synthetic-command'], input='synthetic-input', capture_output=True,
         shell=False, text=True, timeout=2,
-    )] * len(exitCodes)))
-    assert (MUT.time.sleep.call_args_list == (
-        [mock.call(3)] * (len(exitCodes) - 1)
-    ))
+    )
+    assert (run.call_args_list == ([expectedCall] * len(exitCodes)))
+    assert (sleep.call_args_list == ([mock.call(3)] * (len(exitCodes) - 1)))
     expected = []
     for (attempt, code) in enumerate(exitCodes, 1):
         if (code and (warnOnFail is not False)):
@@ -103,9 +105,10 @@ def test_Run_WarnOnFailPreservesExceptionLoggingAndRetries(
     isSecret: bool,
     exception: Exception,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT.subprocess, 'run')
-    Utils.AutoPatch(monkeypatch, MUT.time, 'sleep')
-    MUT.subprocess.run.side_effect = exception
+    run = mock.Mock(side_effect=exception)
+    sleep = mock.Mock()
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
+    monkeypatch.setattr(MUT, 'time', SimpleNamespace(sleep=sleep))
     with caplog.at_level('INFO'):
         result = MUT.CmdExec(defTryMax=2, tryWait=4).Run(
             ['synthetic-command'], isSecret=isSecret, warnOnFail=False,
@@ -113,10 +116,8 @@ def test_Run_WarnOnFailPreservesExceptionLoggingAndRetries(
     plumbing = isinstance(exception, subprocess.SubprocessError)
     attempts = 2 if plumbing else 1
     assert (result == MUT.CmdRes('', str(exception), -2, False))
-    assert (MUT.subprocess.run.call_count == attempts)
-    assert (MUT.time.sleep.call_args_list == (
-        [mock.call(4)] if plumbing else []
-    ))
+    assert (run.call_count == attempts)
+    assert (sleep.call_args_list == ([mock.call(4)] if plumbing else []))
     kind = (
         'Subprocess plumbing exception' if plumbing
         else 'Critical environment exception'
@@ -138,19 +139,20 @@ def test_Run_WarnOnFailPreservesExceptionLoggingAndRetries(
 @pytest.mark.parametrize('warnOnFail', [True, False])
 @pytest.mark.parametrize('isSecret', [True, False])
 @pytest.mark.parametrize('finalCode', [0, 9])
-def test_Run_WarnOnFailPositionalBindingPreservesRetryAndSubprocessOptions(
+def test_Run_PositionalWarnOnFailPreservesSubprocessOptions(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     warnOnFail: bool,
     isSecret: bool,
     finalCode: int,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT.subprocess, 'run')
-    Utils.AutoPatch(monkeypatch, MUT.time, 'sleep')
-    MUT.subprocess.run.side_effect = [
+    run = mock.Mock(side_effect=[
         Completed(7, 'first-output', 'first-error'),
         Completed(finalCode, 'last-output', 'last-error'),
-    ]
+    ])
+    sleep = mock.Mock()
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
+    monkeypatch.setattr(MUT, 'time', SimpleNamespace(sleep=sleep))
     with caplog.at_level('INFO'):
         result = MUT.CmdExec(defTryMax=4, tryWait=3).Run(
             ['synthetic'], True, 'payload', isSecret, warnOnFail, 2,
@@ -160,13 +162,16 @@ def test_Run_WarnOnFailPositionalBindingPreservesRetryAndSubprocessOptions(
     assert (result == MUT.CmdRes(
         'last-output', 'last-error', finalCode, (finalCode == 0),
     ))
-    assert (MUT.subprocess.run.call_args_list == ([mock.call(
+    expectedCall = mock.call(
         ['synthetic'], input='payload', capture_output=True, shell=True,
         text=False, timeout=9,
-    )] * 2))
-    MUT.time.sleep.assert_called_once_with(3)
-    warnings = [entry.message for entry in caplog.records
-                if (entry.levelname == 'WARNING')]
+    )
+    assert (run.call_args_list == ([expectedCall] * 2))
+    sleep.assert_called_once_with(3)
+    warnings = [
+        entry.message for entry in caplog.records
+        if (entry.levelname == 'WARNING')
+    ]
     expected = []
     if warnOnFail:
         detail = '[SNIPPED]' if isSecret else 'first-error'
@@ -199,7 +204,8 @@ def test_Run_ParameterOrderSupportsNormalPositionalBinding() -> None:
 @pytest.mark.parametrize('isSecret', [False, True])
 @pytest.mark.parametrize('text', [False, True])
 @pytest.mark.parametrize('exitCode', [0, 3])
-def test_Run_NativeTextBinaryStdinAndRetryPreserveRawResults(
+def test_Run_TextBinaryInputAndRetryPreserveRawResults(
+    monkeypatch: pytest.MonkeyPatch,
     isSecret: bool,
     text: bool,
     exitCode: int,
@@ -207,75 +213,87 @@ def test_Run_NativeTextBinaryStdinAndRetryPreserveRawResults(
 ) -> None:
     payload = 'synthetic-stdin' if text else b'synthetic-stdin'
     stderr = 'synthetic-stderr' if text else b'synthetic-stderr'
+    run = mock.Mock(side_effect=[
+        Completed(exitCode, payload, stderr) for _ in range(2)
+    ])
+    sleep = mock.Mock()
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
+    monkeypatch.setattr(MUT, 'time', SimpleNamespace(sleep=sleep))
     with caplog.at_level('DEBUG'):
         result = MUT.CmdExec(defTryMax=2, tryWait=0).Run(
-            [sys.executable, '-c',
-             'import sys; '
-             'sys.stdout.buffer.write(sys.stdin.buffer.read()); '
-             'sys.stderr.buffer.write(b"synthetic-stderr"); '
-             f'sys.exit({exitCode})'],
-            input=payload, isSecret=isSecret,
+            ['synthetic-command'], input=payload, isSecret=isSecret,
             spPars={'text': text, 'timeout': 5},
         )
     assert (result == MUT.CmdRes(payload, stderr, exitCode, (exitCode == 0)))
     assert (type(result.stdout) is type(payload))
     assert (type(result.stderr) is type(stderr))
+    attempts = 1 if (exitCode == 0) else 2
+    expectedCall = mock.call(
+        ['synthetic-command'], input=payload, capture_output=True,
+        shell=False, text=text, timeout=5,
+    )
+    assert (run.call_args_list == ([expectedCall] * attempts))
+    assert (sleep.call_args_list == ([mock.call(0)] * (attempts - 1)))
     if isSecret:
         assert ('synthetic-stdin' not in caplog.text)
         assert ('synthetic-stderr' not in caplog.text)
-        if exitCode:
-            assert (caplog.text.count('Command failed with exit code 3') == 2)
-            assert (caplog.text.count(': [SNIPPED]') == 2)
-            assert (('Try 1/2' in caplog.text) and ('Try 2/2' in caplog.text))
-            assert ('Retrying execution in 0 seconds' in caplog.text)
-    elif exitCode:
-        assert (caplog.text.count('Command failed with exit code') == 2)
-        assert ('Retrying execution in 0 seconds' in caplog.text)
+    if exitCode:
+        assert (caplog.text.count('Command failed with exit code 3') == 2)
+        assert (('Try 1/2' in caplog.text) and ('Try 2/2' in caplog.text))
+        assert ('Retrying execution in 0 seconds...' in caplog.text)
+        if isSecret: assert (caplog.text.count(': [SNIPPED]') == 2)
+        else: assert ('synthetic-stderr' in caplog.text)
 
 
 @pytest.mark.parametrize('isSecret', [False, True])
-def test_Run_NativeSubprocessArgumentConflictIsNotIntercepted(
+def test_Run_SubprocessArgumentConflictIsNotIntercepted(
+    monkeypatch: pytest.MonkeyPatch,
     isSecret: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    run = mock.Mock(side_effect=ValueError('stdout and stderr'))
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
     with pytest.raises(ValueError, match='stdout and stderr'):
         MUT.CmdExec().Run(
-            [sys.executable, '-c', 'pass'], isSecret=isSecret,
+            ['synthetic-command'], isSecret=isSecret,
             spPars={'stdout': subprocess.PIPE},
         )
+    run.assert_called_once_with(
+        ['synthetic-command'], input=None, capture_output=True,
+        shell=False, text=True, stdout=subprocess.PIPE,
+    )
     assert (caplog.text == '')
 
 
 @pytest.mark.parametrize('isSecret', [False, True])
-def test_Run_NativeTimeoutPreservesFailureAndSuppressesOnlyLogs(
+def test_Run_TimeoutReturnsStructuredFailureAndSuppressesOnlyLogs(
+    monkeypatch: pytest.MonkeyPatch,
     isSecret: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    result = MUT.CmdExec().Run(
-        [sys.executable, '-c', 'import time; time.sleep(10)'],
-        isSecret=isSecret, spPars={'timeout': 0.02},
-    )
+    timeout = 0.02
+    error = subprocess.TimeoutExpired(['synthetic-command'], timeout)
+    run = mock.Mock(side_effect=error)
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
+    with caplog.at_level('DEBUG'):
+        result = MUT.CmdExec().Run(
+            ['synthetic-command'], isSecret=isSecret,
+            spPars={'timeout': timeout},
+        )
     assert (result.stdout == '')
     assert ((result.exitStat == -2) and (result.success is False))
-    assert ('timed out after 0.02 seconds' in result.stderr)
+    assert (result.stderr == str(error))
+    run.assert_called_once_with(
+        ['synthetic-command'], input=None, capture_output=True,
+        shell=False, text=True, timeout=timeout,
+    )
     if isSecret:
         assert (result.stderr not in caplog.text)
-        assert ('import time' not in caplog.text)
-        assert (('Try 1/1' in caplog.text) and (': [SNIPPED]' in caplog.text))
+        assert ('synthetic-command' not in caplog.text)
+        assert ('Try 1/1' in caplog.text)
+        assert (': [SNIPPED]' in caplog.text)
         assert ('exit code -2' not in caplog.text)
     else: assert (result.stderr in caplog.text)
-
-
-def Completed(
-    returnCode: int,
-    stdout: str = '',
-    stderr: str = '',
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        returncode=returnCode,
-        stdout=stdout,
-        stderr=stderr,
-    )
 
 
 @pytest.mark.parametrize('isSecret', [False, True])
@@ -283,8 +301,8 @@ def test_Run_SuccessPassesSubprocessArguments(
     monkeypatch: pytest.MonkeyPatch,
     isSecret: bool,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT.subprocess, 'run')
-    MUT.subprocess.run.return_value = Completed(0, 'out', 'err')
+    run = mock.Mock(return_value=Completed(0, 'out', 'err'))
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
     executor = MUT.CmdExec(defTryMax=3, tryWait=7)
 
     result = executor.Run(
@@ -292,7 +310,7 @@ def test_Run_SuccessPassesSubprocessArguments(
     )
 
     assert (result == MUT.CmdRes('out', 'err', 0, True))
-    MUT.subprocess.run.assert_called_once_with(
+    run.assert_called_once_with(
         ['tool', 'arg'],
         input='payload',
         capture_output=True,
@@ -305,128 +323,140 @@ def test_Run_SuccessPassesSubprocessArguments(
 def test_Run_NonzeroResultRetriesThenSucceeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT.subprocess, 'run')
-    Utils.AutoPatch(monkeypatch, MUT.time, 'sleep')
-    MUT.subprocess.run.side_effect = [
+    run = mock.Mock(side_effect=[
         Completed(1, stderr='first failure'),
         Completed(0, stdout='recovered'),
-    ]
+    ])
+    sleep = mock.Mock()
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
+    monkeypatch.setattr(MUT, 'time', SimpleNamespace(sleep=sleep))
 
     result = MUT.CmdExec(defTryMax=2, tryWait=4).Run('command', shell=True)
 
     assert result.success
     assert (result.stdout == 'recovered')
-    MUT.time.sleep.assert_called_once_with(4)
-    assert (MUT.subprocess.run.call_count == 2)
+    sleep.assert_called_once_with(4)
+    assert (run.call_count == 2)
+    expectedCall = mock.call(
+        'command', input=None, capture_output=True, shell=True, text=True,
+    )
+    assert (run.call_args_list == ([expectedCall] * 2))
 
 
 def test_Run_FinalNonzeroResultIsReturned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT.subprocess, 'run')
-    Utils.AutoPatch(monkeypatch, MUT.time, 'sleep')
-    MUT.subprocess.run.return_value = Completed(5, stderr='failed')
+    run = mock.Mock(return_value=Completed(5, stderr='failed'))
+    sleep = mock.Mock()
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
+    monkeypatch.setattr(MUT, 'time', SimpleNamespace(sleep=sleep))
 
     result = MUT.CmdExec(defTryMax=1).Run(['bad'])
 
     assert (result == MUT.CmdRes('', 'failed', 5, False))
-    MUT.time.sleep.assert_not_called()
+    sleep.assert_not_called()
+    run.assert_called_once_with(
+        ['bad'], input=None, capture_output=True, shell=False, text=True,
+    )
 
 
-@pytest.mark.parametrize(
-    'exception',
-    [FileNotFoundError('missing'), PermissionError('denied')],
-)
+@pytest.mark.parametrize('exception', [
+    FileNotFoundError('missing'), PermissionError('denied'),
+])
 def test_Run_EnvironmentExceptionsReturnStructuredFailure(
     monkeypatch: pytest.MonkeyPatch,
     exception: OSError,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT.subprocess, 'run')
-    MUT.subprocess.run.side_effect = exception
+    run = mock.Mock(side_effect=exception)
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
 
     result = MUT.CmdExec().Run(['tool'])
 
     assert (result.exitStat == -2)
     assert not result.success
     assert (result.stderr == str(exception))
+    run.assert_called_once_with(
+        ['tool'], input=None, capture_output=True, shell=False, text=True,
+    )
 
 
 def test_Run_SubprocessExceptionRetriesThenReturnsFailure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT.subprocess, 'run')
-    Utils.AutoPatch(monkeypatch, MUT.time, 'sleep')
-    MUT.subprocess.run.side_effect = subprocess.SubprocessError('broken pipe')
+    run = mock.Mock(side_effect=subprocess.SubprocessError('broken pipe'))
+    sleep = mock.Mock()
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
+    monkeypatch.setattr(MUT, 'time', SimpleNamespace(sleep=sleep))
 
     result = MUT.CmdExec(defTryMax=2, tryWait=3).Run(['tool'])
 
     assert (result == MUT.CmdRes('', 'broken pipe', -2, False))
-    assert (MUT.subprocess.run.call_count == 2)
-    assert (MUT.time.sleep.call_args_list == [mock.call(3)])
+    assert (run.call_count == 2)
+    assert (sleep.call_args_list == [mock.call(3)])
 
 
 def test_Run_ZeroAttemptsReturnsMaxTriesFailure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT.subprocess, 'run')
+    run = mock.Mock()
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
 
     result = MUT.CmdExec().Run(['tool'], tryMax=0)
 
     assert (result == MUT.CmdRes(
         '', 'Max. execution tries exceeded.', -3, False,
     ))
-    MUT.subprocess.run.assert_not_called()
+    run.assert_not_called()
 
 
 @pytest.mark.parametrize('isSecret', [False, True])
 @pytest.mark.parametrize('outcome', [
     'success', 'failure', 'missing', 'denied', 'timeout', 'subprocess',
 ])
-def test_Run_SecretPolicyPreservesNativeResultsAndRetries(
+def test_Run_SecretPolicyPreservesResultsAndRetries(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     isSecret: bool,
     outcome: str,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT.subprocess, 'run')
-    Utils.AutoPatch(monkeypatch, MUT.time, 'sleep')
     marker = 'synthetic-sensitive-value'
+    payload = b'synthetic-stdin'
+    output = marker.encode()
     errors = {
         'missing': FileNotFoundError(marker),
         'denied': PermissionError(marker),
         'timeout': subprocess.TimeoutExpired([marker], 1, stderr=marker),
         'subprocess': subprocess.SubprocessError(marker),
     }
-    if (outcome in errors):
-        MUT.subprocess.run.side_effect = errors[outcome]
+    run = mock.Mock()
+    if (outcome in errors): run.side_effect = errors[outcome]
     else:
-        MUT.subprocess.run.return_value = Completed(
-            0 if (outcome == 'success') else 7, marker, marker,
+        run.return_value = Completed(
+            0 if (outcome == 'success') else 7, output, output,
         )
-    executor = Utils.RecordingExec()
-    executor.defTryMax = 2
-    executor.tryWait = 0
+    sleep = mock.Mock()
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
+    monkeypatch.setattr(MUT, 'time', SimpleNamespace(sleep=sleep))
+    executor = MUT.CmdExec(defTryMax=2, tryWait=0)
     with caplog.at_level('DEBUG'):
         result = executor.Run(
-            [marker], input=b'synthetic-stdin', isSecret=isSecret,
+            [marker], input=payload, isSecret=isSecret,
             spPars={'text': False, 'timeout': 2, 'shell': True},
         )
     assert (result.success == (outcome == 'success'))
-    assert (result.stderr == (
-        str(errors[outcome]) if (outcome in errors) else marker
-    ))
-    if (outcome not in errors): assert (result.stdout == marker)
+    expectedError = str(errors[outcome]) if (outcome in errors) else output
+    assert (result.stderr == expectedError)
+    if (outcome not in errors): assert (result.stdout == output)
     attempts = 1 if (outcome in ('success', 'missing', 'denied')) else 2
-    assert (MUT.subprocess.run.call_count == attempts)
-    for call in MUT.subprocess.run.call_args_list:
-        assert (call.args == ([marker],))
-        assert (call.kwargs == {
-            'input': b'synthetic-stdin', 'capture_output': True,
-            'shell': True, 'text': False, 'timeout': 2,
-        })
+    expectedCall = mock.call(
+        [marker], input=payload, capture_output=True, shell=True,
+        text=False, timeout=2,
+    )
+    assert (run.call_args_list == ([expectedCall] * attempts))
+    assert (sleep.call_args_list == ([mock.call(0)] * (attempts - 1)))
+    assert ('synthetic-stdin' not in caplog.text)
     if isSecret:
         assert (marker not in caplog.text)
-        assert ('synthetic-stdin' not in caplog.text)
         if (outcome != 'success'):
             assert (f'Try 1/{executor.defTryMax}' in caplog.text)
             status = -2 if (outcome in errors) else 7
@@ -434,52 +464,59 @@ def test_Run_SecretPolicyPreservesNativeResultsAndRetries(
             assert (': [SNIPPED]' in caplog.text)
             if (outcome in errors):
                 assert ('exit code -2' not in caplog.text)
-                assert ((
+                expectedKind = (
                     'Critical environment exception'
                     if (outcome in ('missing', 'denied'))
                     else 'Subprocess plumbing exception'
-                ) in caplog.text)
+                )
+                assert (expectedKind in caplog.text)
             else: assert (f'exit code {status}' in caplog.text)
         if (attempts == 2):
             assert ('Try 2/2' in caplog.text)
             assert ('Retrying execution in 0 seconds' in caplog.text)
-        assert (executor.inputs == [])
-    else:
-        assert (executor.inputs == [b'synthetic-stdin'])
-        if (outcome != 'success'): assert (marker in caplog.text)
-    assert (MUT.time.sleep.call_args_list == ([mock.call(0)] * (attempts - 1)))
+    elif (outcome != 'success'): assert (marker in caplog.text)
 
 
 @pytest.mark.parametrize('isSecret', [False, True])
-def test_Run_SecretPolicyPreservesNativeUnexpectedException(
+def test_Run_SecretPolicyPreservesUnexpectedException(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     isSecret: bool,
 ) -> None:
-    Utils.AutoPatch(monkeypatch, MUT.subprocess, 'run')
+    run = mock.Mock()
     error = ValueError('synthetic-native-conflict')
-    MUT.subprocess.run.side_effect = error
+    run.side_effect = error
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
     with pytest.raises(ValueError) as caught:
-        MUT.CmdExec().Run(['native'], isSecret=isSecret)
+        MUT.CmdExec().Run(['synthetic-command'], isSecret=isSecret)
     assert (caught.value is error)
+    run.assert_called_once_with(
+        ['synthetic-command'], input=None, capture_output=True,
+        shell=False, text=True,
+    )
     assert (caplog.text == '')
 
 
 @pytest.mark.parametrize('isSecret', [False, True])
-def test_Run_SecretPolicyPreservesRealBinaryProcessContract(
+def test_Run_SecretPolicyPreservesBinarySubprocessResults(
+    monkeypatch: pytest.MonkeyPatch,
     isSecret: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    result = MUT.CmdExec().Run(
-        [sys.executable, '-c',
-         'import sys; sys.stdout.buffer.write(sys.stdin.buffer.read()); '
-         'sys.stderr.buffer.write(b"synthetic-stderr"); sys.exit(3)'],
-        input=b'synthetic-stdin', isSecret=isSecret,
-        spPars={'text': False, 'timeout': 5},
+    payload = b'synthetic-stdin'
+    stderr = b'synthetic-stderr'
+    run = mock.Mock(return_value=Completed(3, payload, stderr))
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
+    with caplog.at_level('DEBUG'):
+        result = MUT.CmdExec().Run(
+            ['synthetic-command'], input=payload, isSecret=isSecret,
+            spPars={'text': False, 'timeout': 5},
+        )
+    assert (result == MUT.CmdRes(payload, stderr, 3, False))
+    run.assert_called_once_with(
+        ['synthetic-command'], input=payload, capture_output=True,
+        shell=False, text=False, timeout=5,
     )
-    assert (result == MUT.CmdRes(
-        b'synthetic-stdin', b'synthetic-stderr', 3, False,
-    ))
     if isSecret:
         assert ('synthetic-stdin' not in caplog.text)
         assert ('synthetic-stderr' not in caplog.text)
@@ -489,35 +526,35 @@ def test_Run_SecretPolicyPreservesRealBinaryProcessContract(
     else: assert ('synthetic-stderr' in caplog.text)
 
 
-def test_Run_SecretNativeRetriesLogOnlySafeMetadata(
+def test_Run_SecretRetriesLogOnlySafeMetadata(
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     marker = 'synthetic-secret-argument'
     payload = b'synthetic-secret-input'
-    executor = Utils.RecordingExec()
-    executor.defTryMax = 2
-    executor.tryWait = 0
+    stderr = b'synthetic-secret-environment'
+    env = {'SYNTHETIC_SECRET': 'synthetic-secret-environment'}
+    run = mock.Mock(side_effect=[
+        Completed(9, payload, stderr), Completed(9, payload, stderr),
+    ])
+    sleep = mock.Mock()
+    monkeypatch.setattr(MUT.subprocess, 'run', run)
+    monkeypatch.setattr(MUT, 'time', SimpleNamespace(sleep=sleep))
     with caplog.at_level('DEBUG'):
-        result = executor.Run(
-            [sys.executable, '-c',
-             'import os, sys; '
-             'sys.stdout.buffer.write(sys.stdin.buffer.read()); '
-             'sys.stderr.write(os.environ["SYNTHETIC_SECRET"]); '
-             'sys.exit(9)', marker],
-            input=payload, isSecret=True,
-            spPars={
-                'text': False, 'timeout': 5,
-                'env': {
-                    **os.environ,
-                    'SYNTHETIC_SECRET': 'synthetic-secret-environment',
-                },
-            },
+        result = MUT.CmdExec(defTryMax=2, tryWait=0).Run(
+            ['synthetic-command', marker], input=payload, isSecret=True,
+            spPars={'text': False, 'timeout': 5, 'env': env},
         )
-    assert (result == MUT.CmdRes(
-        payload, b'synthetic-secret-environment', 9, False,
-    ))
-    assert (executor.inputs == [])
-    for value in (marker, payload.decode(), result.stderr.decode()):
+    assert (result == MUT.CmdRes(payload, stderr, 9, False))
+    expectedCall = mock.call(
+        ['synthetic-command', marker], input=payload, capture_output=True,
+        shell=False, text=False, timeout=5, env=env,
+    )
+    assert (run.call_args_list == ([expectedCall] * 2))
+    assert (sleep.call_args_list == [mock.call(0)])
+    for value in (
+        marker, payload.decode(), stderr.decode(), env['SYNTHETIC_SECRET'],
+    ):
         assert (value not in caplog.text)
     assert (caplog.messages == [
         'Command failed with exit code 9 (Try 1/2): [SNIPPED]',

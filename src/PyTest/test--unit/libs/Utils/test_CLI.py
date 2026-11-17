@@ -6,6 +6,14 @@ import libs.Utils.CLI as MUT
 from libs.Utils.CmdExec import CmdExec, CmdRes
 import Utils
 
+
+@pytest.fixture(autouse=True)
+def PatchShellQuoting(monkeypatch: pytest.MonkeyPatch) -> None:
+    quoting = mock.Mock(name='shlex')
+    quoting.quote.return_value = 'quoted-tool'
+    monkeypatch.setattr(MUT, 'shlex', quoting)
+
+
 optionsText = '''
   -n, --namespace string   Namespace
       --kubeconfig string  Config
@@ -46,6 +54,7 @@ def test__DiscoverOptions_FailureLeavesMapsEmpty(
     assert (cli.cmnOpts == {})
     assert (cli.shortMap == {})
     assert ('Failed to discover' in caplog.text)
+    MUT.shlex.quote.assert_called_once_with('missing tool')
 
 
 def test_Init_DefaultExecutorIsCreated(
@@ -172,7 +181,7 @@ def test_Run_SecretFlagIsExecutorMetadataNotCLIOption(isSecret: bool) -> None:
     executor.Run.return_value = expected
     result = cli.Run(
         'create', 'secret', input='synthetic-payload',
-        spPars={'timeout': 4}, isSecret=isSecret,
+        isSecret=isSecret, spPars={'timeout': 4},
     )
     assert (result is expected)
     executor.Run.assert_called_once_with(
