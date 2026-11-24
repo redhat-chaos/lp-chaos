@@ -1,4 +1,7 @@
 FROM quay.io/openshift/ci:ocp_4.20_cli
+# Copy only the requirements before `RUN`, so that other `src/PyTest` changes
+#   keep the cached `RUN` layer.
+COPY src/PyTest/requirements--main.txt /lp-chaos/src/PyTest/
 RUN <<run-EOF
 set -exo pipefail; shopt -s inherit_errexit
 typeset binDir=/usr/local/bin toolName=
@@ -49,5 +52,13 @@ toolName=virtctl && {
         sh -s -- --quiet
 }
 
+# Install Python 3.11 and the PyTest framework requirements.
+dnf install --setopt tsflags=nodocs -y python3.11 python3.11-pip
+dnf clean all
+rm -rf /var/cache/dnf/*
+python3.11 -m pip install --no-cache-dir --root-user-action=ignore \
+    -r /lp-chaos/src/PyTest/requirements--main.txt
+
 true
 run-EOF
+COPY src/PyTest /lp-chaos/src/PyTest
