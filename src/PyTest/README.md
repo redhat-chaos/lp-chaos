@@ -212,12 +212,17 @@ Markers in the `ts--example/`:
   - `krkn`: A [KrknHub `pod-scenario` example](test--suites/ts--example/test_Krkn.py) kills a Pod in a Deployment and asserts a new one is respawned
     automatically.
 
+Markers in the `ts--ODF/`:
+  - `odf__mds`: [ODF MDS regression tests](test--suites/ts--ODF/test_Regression.py) stop the kubelet on the standby-replay MDS Node, check the replacement MDS
+    for a File Descriptor leak and `EMFILE`, then check that a CephFS failover completes. A run takes about one hour.
+
 Inspect live-suite selection without executing fixture setup:
 ```bash
 python -m pytest -c pytest.ini test--suites/ --collect-only
 python -m pytest -c pytest.ini test--suites/ -m vm --collect-only
 python -m pytest -c pytest.ini test--suites/ -m vm__br --collect-only
 python -m pytest -c pytest.ini test--suites/ -m krkn --collect-only
+python -m pytest -c pytest.ini test--suites/ -m odf__mds --collect-only
 ```
 
 Only remove `--collect-only` on an authorized, disposable CUT after reviewing the selected tests' creation, disruption, guest-access, and cleanup requirements.
