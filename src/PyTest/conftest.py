@@ -10,4 +10,5 @@ pytest_plugins = [
     'fixtures.VM',
     'fixtures.Krkn',
     'fixtures.BenchmarkRunner',
+    'fixtures.ODF',
 ]
